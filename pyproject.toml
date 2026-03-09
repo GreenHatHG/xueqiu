@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xueqiu-crawler"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "playwright>=1.41",
+]
+
+[dependency-groups]
+dev = [
+  "pre-commit",
+  "ruff",
+  "mypy",
+]
+
+[project.scripts]
+xq-crawl = "xueqiu_crawler.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.mypy]
+mypy_path = ["."]
+ignore_missing_imports = true
+
+[tool.vulture]
+paths = ["."]
+exclude = ["venv", ".venv", ".uv-cache"]
+sort_by_size = true
+ignore_names = ["pytest_configure"]

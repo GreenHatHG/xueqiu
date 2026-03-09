@@ -1,0 +1,13 @@
+.ace-tool/
+out/
+data/
+storage_state.json
+.playwright/
+**/__pycache__/
+.pytest_cache/
+.venv/
+.DS_Store
+.vscode
+.idea
+/src/xueqiu_crawler.egg-info/
+uv.lock
