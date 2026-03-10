@@ -30,6 +30,22 @@
 
 `uv run xq-crawl --user-id 9650668145 --since 2026-03-06`
 
+如果你想按用户列表顺序抓取，并统一写入一个 SQLite，可先准备一个 UTF-8 文本文件（每行一个用户 ID，空行与以 `#` 开头的注释行会忽略），例如：
+
+```text
+9650668145
+# 下面继续追加别的用户
+1234567890
+```
+
+然后执行：
+
+`uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06`
+
+批量模式默认会把所有用户写入同一个数据库 `data/xueqiu_batch.sqlite3`，并在相邻两个用户之间额外等待 `60` 秒。你也可以显式指定统一库路径，或调整等待时间：
+
+`uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06 --db data/my_batch.sqlite3 --user-cooldown-sec 90`
+
 补充说明：当前 `timeline` 会全自动打开用户主页并通过滚动/翻页触发页面自身请求，再在浏览器侧拦截 `/v4/statuses/user_timeline.json` 的响应落盘；`comments` 在默认会话下仍采用类似方式，但如果你用了 `--cdp` 连接本机正常 Chrome，则会优先在该浏览器会话内直接请求 `/statuses/user/comments.json?user_id=...&size=...&max_id=...`。若在一定窗口内完全拿不到目标 JSON，会在 `data/html/{user_id}/` 写入 HTML 快照并提示你已降级留痕（避免静默失败）。core 模式默认也会尽量补齐每条回复的“查看对话”（talks）；如果你只要主干数据，可加 `--no-talks`。
 
 如果你遇到风控导致抓取或 talks 补齐失败，优先使用 `--cdp` 连接你本机正常 Chrome Profile（更接近日常浏览，尤其对 `comments` 的 direct fetch 更稳）。
@@ -56,6 +72,7 @@
 输出默认写到 `data/`：
 
 - `data/xueqiu_{user_id}.sqlite3`：唯一主输出（SQLite 数据库，最终只保留可直接阅读的展示记录；每一行要么是单独原博文，要么是一整条评论链，原始来源数据保存在 `payload_json` 中）
+- `data/xueqiu_batch.sqlite3`：批量模式的默认统一输出库；同一个库里通过 `user_id` 字段区分不同用户
 - `data/html/{user_id}/`：当未能拦截到目标 JSON 响应时，降级保存 HTML 快照（用于诊断风控/页面结构变化）
 
 查看结果时，建议优先直接看表里的 `text` 字段；如果后续需要追溯这条记录来自哪条 status/comment/talk，再看同一行里的 `payload_json`。
@@ -66,7 +83,9 @@
 
 - 单页面串行请求（不并发）
 - 请求间最小延迟 + 随机抖动
+- 批量模式下，用户与用户之间额外冷却等待（默认 `--user-cooldown-sec 60`）
 - 429/403/返回 HTML（挑战页）视为风控信号：指数退避重试，达到阈值自动停止并落盘断点
+- 批量模式中只要某个用户出现高风险拦截或登录态问题，默认停止后续用户，避免继续冲撞
 - SQLite 内置缓存表（同一 DB 文件中）减少重复访问
 
 你可以用这些参数更保守或更激进，但不建议把延迟降得太低：

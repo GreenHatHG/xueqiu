@@ -8,6 +8,8 @@ BEIJING_TIMEZONE_NAME = "Asia/Shanghai"
 DEFAULT_USER_DATA_DIR = Path(".playwright") / "user-data"
 DEFAULT_OUTPUT_DIR = Path("data")
 DEFAULT_DB_BASENAME = "xueqiu_{user_id}.sqlite3"
+DEFAULT_BATCH_DB_BASENAME = "xueqiu_batch.sqlite3"
+DEFAULT_BATCH_USER_COOLDOWN_SEC = 60.0
 
 # Anti-abuse defaults: conservative on purpose.
 DEFAULT_MIN_DELAY_SEC = 1.2

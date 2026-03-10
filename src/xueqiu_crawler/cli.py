@@ -17,6 +17,8 @@ from urllib.request import Request, urlopen
 from .constants import (
     BASE_URL,
     BEIJING_TIMEZONE_NAME,
+    DEFAULT_BATCH_DB_BASENAME,
+    DEFAULT_BATCH_USER_COOLDOWN_SEC,
     DEFAULT_CORE_MAX_USER_COMMENTS_SCAN_PAGES,
     DEFAULT_CORE_MAX_TALK_PAGES,
     DEFAULT_DB_BASENAME,
@@ -67,7 +69,13 @@ def _format_progress_dt(value: Optional[dt.datetime]) -> str:
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="xq-crawl")
-    p.add_argument("--user-id", required=True, help="雪球用户ID，例如 9650668145")
+    user_group = p.add_mutually_exclusive_group(required=True)
+    user_group.add_argument("--user-id", help="雪球用户ID，例如 9650668145")
+    user_group.add_argument(
+        "--user-list-file",
+        type=Path,
+        help="批量用户列表文件路径（UTF-8 文本；每行一个用户ID，空行与 # 注释行会忽略）",
+    )
     p.add_argument(
         "--mode",
         default="core",
@@ -86,7 +94,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--db",
         type=Path,
         default=None,
-        help="SQLite 数据库文件路径（默认：{out}/xueqiu_{user_id}.sqlite3）。本项目已切换为“只落库”，不再生成 JSONL/CSV/JSON 文件。",
+        help=(
+            "SQLite 数据库文件路径（单用户默认：{out}/"
+            f"{DEFAULT_DB_BASENAME}；"
+            f"批量默认：{{out}}/{DEFAULT_BATCH_DB_BASENAME}）。"
+            "本项目已切换为“只落库”，不再生成 JSONL/CSV/JSON 文件。"
+        ),
     )
     p.add_argument(
         "--skip-login-check",
@@ -149,6 +162,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=DEFAULT_MAX_CONSECUTIVE_BLOCKS,
         help="连续被风控/返回HTML次数阈值，超过则停止",
+    )
+    p.add_argument(
+        "--user-cooldown-sec",
+        type=float,
+        default=DEFAULT_BATCH_USER_COOLDOWN_SEC,
+        help=(
+            "批量模式下，相邻两个用户之间额外等待的秒数"
+            f"（默认 {DEFAULT_BATCH_USER_COOLDOWN_SEC}；单用户模式忽略）"
+        ),
     )
 
     p.add_argument(
@@ -487,7 +509,7 @@ def _page_signature(page) -> str:
 
 def _click_next_page_and_wait(page, *, stats: "_UiInterceptStats") -> bool:
     print(
-        f"[{stats.kind_name}] 当前页空转，尝试翻到下一页；已扫到最旧日期 {_format_progress_dt(stats.last_batch_oldest)}",
+        f"[{stats.kind_name}] 这一页没新数据了，准备翻页；已扫到最旧日期 {_format_progress_dt(stats.last_batch_oldest)}",
         file=sys.stderr,
     )
     previous_signature = _page_signature(page)
@@ -770,7 +792,7 @@ def _crawl_via_ui_intercept(
                     time.sleep(UI_INTERCEPT_PAGE_TURN_SETTLE_SEC)
                     continue
                 print(
-                    f"[{kind_name}] 已达到空转阈值，且无法继续翻页，停止抓取；当前最旧日期 {_format_progress_dt(stats.last_batch_oldest)}",
+                    f"[{kind_name}] 长时间没拿到数据，停止抓取；当前最旧日期 {_format_progress_dt(stats.last_batch_oldest)}",
                     file=sys.stderr,
                 )
                 break
@@ -968,6 +990,321 @@ def _backfill_talks_since(
     return wrote
 
 
+def _load_user_ids_from_file(path: Path) -> list[str]:
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise RuntimeError(f"用户列表文件不存在：{file_path}")
+
+    try:
+        lines = file_path.read_text(encoding="utf-8").splitlines()
+    except Exception as e:
+        raise RuntimeError(f"读取用户列表文件失败：{file_path}，原因：{e}") from e
+
+    user_ids: list[str] = []
+    seen: set[str] = set()
+    for raw_line in lines:
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line in seen:
+            continue
+        seen.add(line)
+        user_ids.append(line)
+
+    if not user_ids:
+        raise RuntimeError(f"用户列表文件里没有可用的用户ID：{file_path}")
+    return user_ids
+
+
+def _resolve_target_user_ids(args: argparse.Namespace) -> list[str]:
+    if args.user_list_file is not None:
+        return _load_user_ids_from_file(Path(args.user_list_file))
+
+    user_id = str(args.user_id or "").strip()
+    if not user_id:
+        raise RuntimeError("必须提供 --user-id 或 --user-list-file")
+    return [user_id]
+
+
+def _resolve_db_path(
+    *, args: argparse.Namespace, out_dir: Path, is_batch_mode: bool
+) -> Path:
+    if args.db is not None:
+        return Path(args.db)
+    if is_batch_mode:
+        return out_dir / DEFAULT_BATCH_DB_BASENAME
+    return out_dir / DEFAULT_DB_BASENAME.format(user_id=str(args.user_id))
+
+
+def _run_single_user(
+    *,
+    args: argparse.Namespace,
+    db: SqliteDb,
+    db_path: Path,
+    out_dir: Path,
+    session,
+    user_id: str,
+) -> int:
+    api_cfg = ApiConfig(
+        min_delay_sec=args.min_delay,
+        jitter_sec=args.jitter,
+        max_retries=args.max_retries,
+        max_consecutive_blocks=args.max_consecutive_blocks,
+    )
+    timeline_store = SqliteMergedStatusesStore(db=db, user_id=str(user_id))
+    comment_store = SqliteMergedCommentsStore(db=db, user_id=str(user_id))
+    talks_store = SqliteMergedTalksStore(db=db, user_id=str(user_id))
+
+    # Cross-run de-dup relies on SQLite unique key (merge_key). Keep in-run sets only.
+    seen_status_ids: set[str] = set()
+    seen_comment_ids: set[str] = set()
+
+    ui_page = session.ui_page
+    data_page = ui_page if args.cdp else session.page
+    data_api = XueqiuApi(data_page, api_cfg, prefer_page_fetch=bool(args.cdp))
+    # Keep api_page around for talks backfill and future extensions.
+    detail_api = XueqiuApi(session.page, api_cfg)
+    detail_status_line_cache: dict[tuple[str, str, str, str], Optional[str]] = {}
+    user_log_prefix = f"[user {user_id}]"
+
+    def resolve_status_line(
+        status_id: str,
+        source_status_url: str = "",
+        status_url: str = "",
+        status_user_id: str = "",
+    ) -> Optional[str]:
+        sid = str(status_id or "").strip()
+        if not sid:
+            return None
+        cache_key = (
+            sid,
+            str(source_status_url or "").strip(),
+            str(status_url or "").strip(),
+            str(status_user_id or "").strip(),
+        )
+        if cache_key in detail_status_line_cache:
+            return detail_status_line_cache[cache_key]
+        print(f"[detail] 尝试补抓原帖全文 status_id={sid}", file=sys.stderr)
+        line = detail_api.fetch_status_display_line(
+            sid,
+            source_status_url=source_status_url,
+            status_url=status_url,
+            status_user_id=status_user_id,
+        )
+        if line:
+            print(f"[detail] 原帖全文补抓成功 status_id={sid}", file=sys.stderr)
+        else:
+            print(f"[detail] 原帖全文补抓失败 status_id={sid}", file=sys.stderr)
+        detail_status_line_cache[cache_key] = line
+        return line
+
+    if args.skip_login_check:
+        ui_page.goto(BASE_URL, wait_until="domcontentloaded")
+    else:
+        try:
+            _ensure_logged_in_ui(ui_page, int(args.login_timeout_sec))
+        except Exception as e:
+            print(f"登录态等待失败：{e}", file=sys.stderr)
+            return 2
+
+    if args.mode != "core":
+        print("当前仅支持 core 模式。", file=sys.stderr)
+        return 2
+
+    tz_name = str(args.tz)
+    try:
+        since_bj = _parse_since_to_beijing(args.since, tz_name=tz_name)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    # core 模式默认尽量把“查看对话”也补齐；如果你只要主干数据可用 --no-talks 关闭。
+    want_talks = bool(args.with_talks) or (not bool(args.no_talks))
+
+    had_blocked = False
+    wrote_statuses = 0
+    wrote_comments = 0
+    wrote_talks = 0
+    limiter = RateLimiter(float(args.min_delay), float(args.jitter))
+
+    timeline_result = _crawl_via_ui_intercept(
+        page=ui_page,
+        out_dir=out_dir,
+        user_id=str(user_id),
+        since_bj=since_bj,
+        url=_profile_url(str(user_id)),
+        url_contains="/v4/statuses/user_timeline.json",
+        max_batches=int(args.max_timeline_pages),
+        store=timeline_store,
+        seen_ids=seen_status_ids,
+        normalize_fn=_normalize_timeline_status,
+        extract_records_fn=_extract_timeline_records,
+        limiter=limiter,
+        kind_name="timeline",
+    )
+    wrote_statuses = int(timeline_result.wrote)
+    if wrote_statuses:
+        print(
+            f"{user_log_prefix} 时间线新增写入 {wrote_statuses} 条到 SQLite：{db_path}"
+        )
+    elif not timeline_result.saw_any and timeline_result.html_path:
+        print(
+            f"{user_log_prefix} 未拦截到时间线 JSON，已降级保存 HTML 快照：{timeline_result.html_path}",
+            file=sys.stderr,
+        )
+
+    if args.cdp:
+        try:
+            wrote_comments, _comments_oldest, comments_pages = _crawl_comments_via_api(
+                api=data_api,
+                user_id=str(user_id),
+                since_bj=since_bj,
+                max_pages=int(args.max_comment_pages),
+                store=comment_store,
+                seen_ids=seen_comment_ids,
+            )
+        except ChallengeRequiredError as e:
+            try:
+                target_url = getattr(e, "final_url", "") or data_api.build_url(
+                    "/statuses/user/comments.json",
+                    {
+                        "user_id": str(user_id),
+                        "size": USER_COMMENTS_PAGE_SIZE,
+                        "max_id": -1,
+                    },
+                )
+                _wait_for_waf_challenge(
+                    ui_page,
+                    data_api,
+                    user_id,
+                    int(args.login_timeout_sec),
+                    target_url,
+                    navigate_to_blocked_url=not bool(args.cdp),
+                )
+                wrote_comments, _comments_oldest, comments_pages = (
+                    _crawl_comments_via_api(
+                        api=data_api,
+                        user_id=str(user_id),
+                        since_bj=since_bj,
+                        max_pages=int(args.max_comment_pages),
+                        store=comment_store,
+                        seen_ids=seen_comment_ids,
+                    )
+                )
+            except Exception as e2:
+                had_blocked = True
+                wrote_comments, _comments_oldest, comments_pages = 0, None, 0
+                print(f"{user_log_prefix} 回复抓取被拦截：{e2}", file=sys.stderr)
+        except BlockedError as e:
+            had_blocked = True
+            wrote_comments, _comments_oldest, comments_pages = 0, None, 0
+            print(f"{user_log_prefix} 回复接口当前不可用：{e}", file=sys.stderr)
+        if wrote_comments:
+            print(
+                f"{user_log_prefix} 回复新增写入 {wrote_comments} 条到 SQLite：{db_path}"
+            )
+        elif comments_pages == 0:
+            html2 = _write_html_snapshot(
+                out_dir,
+                user_id=str(user_id),
+                kind="comments",
+                page=ui_page,
+            )
+            if html2:
+                print(
+                    f"{user_log_prefix} 未获取到回复 JSON，已降级保存 HTML 快照：{html2}",
+                    file=sys.stderr,
+                )
+    else:
+        comments_result = _crawl_via_ui_intercept(
+            page=ui_page,
+            out_dir=out_dir,
+            user_id=str(user_id),
+            since_bj=since_bj,
+            url=_comments_url(str(user_id)),
+            url_contains="/statuses/user/comments.json",
+            max_batches=int(args.max_comment_pages),
+            store=comment_store,
+            seen_ids=seen_comment_ids,
+            normalize_fn=_normalize_user_comment,
+            extract_records_fn=_extract_comment_records,
+            limiter=limiter,
+            kind_name="comments",
+        )
+        wrote_comments = int(comments_result.wrote)
+        comments_pages = int(comments_result.captured_batches)
+        if wrote_comments:
+            print(
+                f"{user_log_prefix} 回复新增写入 {wrote_comments} 条到 SQLite：{db_path}"
+            )
+        elif not comments_result.saw_any and comments_result.html_path:
+            print(
+                f"{user_log_prefix} 未拦截到回复 JSON，已降级保存 HTML 快照：{comments_result.html_path}",
+                file=sys.stderr,
+            )
+
+    if want_talks:
+        talks_api = detail_api
+        try:
+            wrote_talks = _backfill_talks_since(
+                api=talks_api,
+                user_id=str(user_id),
+                since_bj=since_bj,
+                max_talk_pages=int(args.max_talk_pages),
+                comments_store=comment_store,
+                talks_store=talks_store,
+            )
+        except ChallengeRequiredError as e:
+            try:
+                _wait_for_waf_challenge(
+                    ui_page,
+                    talks_api,
+                    user_id,
+                    int(args.login_timeout_sec),
+                    getattr(e, "final_url", e.url),
+                )
+                wrote_talks = _backfill_talks_since(
+                    api=talks_api,
+                    user_id=str(user_id),
+                    since_bj=since_bj,
+                    max_talk_pages=int(args.max_talk_pages),
+                    comments_store=comment_store,
+                    talks_store=talks_store,
+                )
+            except Exception as e2:
+                had_blocked = True
+                print(f"{user_log_prefix} 查看对话抓取被拦截：{e2}", file=sys.stderr)
+        except BlockedError as e:
+            had_blocked = True
+            print(f"{user_log_prefix} 查看对话抓取被拦截：{e}", file=sys.stderr)
+        except Exception as e:
+            had_blocked = True
+            print(f"{user_log_prefix} 查看对话抓取失败：{e}", file=sys.stderr)
+        if wrote_talks:
+            print(
+                f"{user_log_prefix} 查看对话新增/补齐写入 {wrote_talks} 份到 SQLite：{db_path}"
+            )
+
+    final_entries = collapse_user_records_to_entries(
+        db=db,
+        user_id=str(user_id),
+        resolve_status_line=resolve_status_line,
+    )
+    if final_entries:
+        print(
+            f"{user_log_prefix} 最终展示记录写入 {final_entries} 条到 SQLite：{db_path}"
+        )
+
+    if had_blocked and (wrote_statuses + wrote_comments + wrote_talks == 0):
+        print(
+            "提示：当前会话下接口暂时不可用。这可能是真正的风控挑战页，也可能是非 JSON/HTML 拦截页。"
+            "如果程序明确提示需要手动验证，请在 UI 标签页处理后重试；否则优先检查当前会话是否仍能稳定返回 JSON。",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -993,284 +1330,60 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"建议先在终端验证：curl -s {version_url}", file=sys.stderr)
             return 2
 
-    db_path: Path
-    if args.db:
-        db_path = Path(args.db)
-    else:
-        db_path = out_dir / DEFAULT_DB_BASENAME.format(user_id=str(args.user_id))
+    try:
+        target_user_ids = _resolve_target_user_ids(args)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    is_batch_mode = args.user_list_file is not None
+    db_path = _resolve_db_path(args=args, out_dir=out_dir, is_batch_mode=is_batch_mode)
+    cooldown_sec = max(0.0, float(args.user_cooldown_sec))
+
+    # Import Playwright-dependent modules only when we actually need to crawl.
+    from .browser import BrowserConfig, BrowserSession
+
+    browser_cfg = BrowserConfig(
+        headless=bool(args.headless),
+        user_data_dir=Path(args.user_data_dir),
+        chrome_channel=None if args.cdp else str(args.chrome_channel or "chrome"),
+        cdp_url=str(args.cdp) if args.cdp else None,
+        reduce_automation_fingerprint=bool(args.reduce_automation_fingerprint),
+    )
+
+    if is_batch_mode:
+        print(
+            f"批量模式：共 {len(target_user_ids)} 个用户，统一写入 SQLite：{db_path}",
+            file=sys.stderr,
+        )
 
     with SqliteDb(db_path) as db:
-        api_cfg = ApiConfig(
-            min_delay_sec=args.min_delay,
-            jitter_sec=args.jitter,
-            max_retries=args.max_retries,
-            max_consecutive_blocks=args.max_consecutive_blocks,
-        )
-
-        # Import Playwright-dependent modules only when we actually need to crawl.
-        from .browser import BrowserConfig, BrowserSession
-
-        browser_cfg = BrowserConfig(
-            headless=bool(args.headless),
-            user_data_dir=Path(args.user_data_dir),
-            chrome_channel=None if args.cdp else str(args.chrome_channel or "chrome"),
-            cdp_url=str(args.cdp) if args.cdp else None,
-            reduce_automation_fingerprint=bool(args.reduce_automation_fingerprint),
-        )
-
-        timeline_store = SqliteMergedStatusesStore(db=db, user_id=str(args.user_id))
-        comment_store = SqliteMergedCommentsStore(db=db, user_id=str(args.user_id))
-        talks_store = SqliteMergedTalksStore(db=db, user_id=str(args.user_id))
-
-        # Cross-run de-dup relies on SQLite unique key (merge_key). Keep in-run sets only.
-        seen_status_ids: set[str] = set()
-        seen_comment_ids: set[str] = set()
-
         with BrowserSession(browser_cfg) as session:
-            ui_page = session.ui_page
-            data_page = ui_page if args.cdp else session.page
-            data_api = XueqiuApi(data_page, api_cfg, prefer_page_fetch=bool(args.cdp))
-            # Keep api_page around for talks backfill and future extensions.
-            detail_api = XueqiuApi(session.page, api_cfg)
-            detail_status_line_cache: dict[
-                tuple[str, str, str, str], Optional[str]
-            ] = {}
-
-            def resolve_status_line(
-                status_id: str,
-                source_status_url: str = "",
-                status_url: str = "",
-                status_user_id: str = "",
-            ) -> Optional[str]:
-                sid = str(status_id or "").strip()
-                if not sid:
-                    return None
-                cache_key = (
-                    sid,
-                    str(source_status_url or "").strip(),
-                    str(status_url or "").strip(),
-                    str(status_user_id or "").strip(),
-                )
-                if cache_key in detail_status_line_cache:
-                    return detail_status_line_cache[cache_key]
-                print(f"[detail] 尝试补抓原帖全文 status_id={sid}", file=sys.stderr)
-                line = detail_api.fetch_status_display_line(
-                    sid,
-                    source_status_url=source_status_url,
-                    status_url=status_url,
-                    status_user_id=status_user_id,
-                )
-                if line:
-                    print(f"[detail] 原帖全文补抓成功 status_id={sid}", file=sys.stderr)
-                else:
-                    print(f"[detail] 原帖全文补抓失败 status_id={sid}", file=sys.stderr)
-                detail_status_line_cache[cache_key] = line
-                return line
-
-            if args.skip_login_check:
-                ui_page.goto(BASE_URL, wait_until="domcontentloaded")
-            else:
-                try:
-                    _ensure_logged_in_ui(ui_page, int(args.login_timeout_sec))
-                except Exception as e:
-                    print(f"登录态等待失败：{e}", file=sys.stderr)
-                    return 2
-
-            if args.mode == "core":
-                tz_name = str(args.tz)
-                try:
-                    since_bj = _parse_since_to_beijing(args.since, tz_name=tz_name)
-                except Exception as e:
-                    print(str(e), file=sys.stderr)
-                    return 2
-
-                # core 模式默认尽量把“查看对话”也补齐；如果你只要主干数据可用 --no-talks 关闭。
-                want_talks = bool(args.with_talks) or (not bool(args.no_talks))
-
-                had_blocked = False
-                wrote_statuses = 0
-                wrote_comments = 0
-                wrote_talks = 0
-                limiter = RateLimiter(float(args.min_delay), float(args.jitter))
-
-                timeline_result = _crawl_via_ui_intercept(
-                    page=ui_page,
+            total = len(target_user_ids)
+            for index, user_id in enumerate(target_user_ids, start=1):
+                print(f"开始抓取用户 {index}/{total}：{user_id}", file=sys.stderr)
+                result = _run_single_user(
+                    args=args,
+                    db=db,
+                    db_path=db_path,
                     out_dir=out_dir,
-                    user_id=str(args.user_id),
-                    since_bj=since_bj,
-                    url=_profile_url(str(args.user_id)),
-                    url_contains="/v4/statuses/user_timeline.json",
-                    max_batches=int(args.max_timeline_pages),
-                    store=timeline_store,
-                    seen_ids=seen_status_ids,
-                    normalize_fn=_normalize_timeline_status,
-                    extract_records_fn=_extract_timeline_records,
-                    limiter=limiter,
-                    kind_name="timeline",
+                    session=session,
+                    user_id=str(user_id),
                 )
-                wrote_statuses = int(timeline_result.wrote)
-                if wrote_statuses:
-                    print(f"时间线新增写入 {wrote_statuses} 条到 SQLite：{db_path}")
-                elif not timeline_result.saw_any and timeline_result.html_path:
-                    print(
-                        f"未拦截到时间线 JSON，已降级保存 HTML 快照：{timeline_result.html_path}",
-                        file=sys.stderr,
-                    )
-
-                if args.cdp:
-                    try:
-                        wrote_comments, _comments_oldest, comments_pages = (
-                            _crawl_comments_via_api(
-                                api=data_api,
-                                user_id=str(args.user_id),
-                                since_bj=since_bj,
-                                max_pages=int(args.max_comment_pages),
-                                store=comment_store,
-                                seen_ids=seen_comment_ids,
-                            )
-                        )
-                    except ChallengeRequiredError as e:
-                        try:
-                            target_url = getattr(
-                                e, "final_url", ""
-                            ) or data_api.build_url(
-                                "/statuses/user/comments.json",
-                                {
-                                    "user_id": str(args.user_id),
-                                    "size": USER_COMMENTS_PAGE_SIZE,
-                                    "max_id": -1,
-                                },
-                            )
-                            _wait_for_waf_challenge(
-                                ui_page,
-                                data_api,
-                                args.user_id,
-                                int(args.login_timeout_sec),
-                                target_url,
-                                navigate_to_blocked_url=not bool(args.cdp),
-                            )
-                            wrote_comments, _comments_oldest, comments_pages = (
-                                _crawl_comments_via_api(
-                                    api=data_api,
-                                    user_id=str(args.user_id),
-                                    since_bj=since_bj,
-                                    max_pages=int(args.max_comment_pages),
-                                    store=comment_store,
-                                    seen_ids=seen_comment_ids,
-                                )
-                            )
-                        except Exception as e2:
-                            had_blocked = True
-                            wrote_comments, _comments_oldest, comments_pages = (
-                                0,
-                                None,
-                                0,
-                            )
-                            print(f"回复抓取被拦截：{e2}", file=sys.stderr)
-                    except BlockedError as e:
-                        had_blocked = True
-                        wrote_comments, _comments_oldest, comments_pages = 0, None, 0
-                        print(f"回复接口当前不可用：{e}", file=sys.stderr)
-                    if wrote_comments:
-                        print(f"回复新增写入 {wrote_comments} 条到 SQLite：{db_path}")
-                    elif comments_pages == 0:
-                        html2 = _write_html_snapshot(
-                            out_dir,
-                            user_id=str(args.user_id),
-                            kind="comments",
-                            page=ui_page,
-                        )
-                        if html2:
-                            print(
-                                f"未获取到回复 JSON，已降级保存 HTML 快照：{html2}",
-                                file=sys.stderr,
-                            )
-                else:
-                    comments_result = _crawl_via_ui_intercept(
-                        page=ui_page,
-                        out_dir=out_dir,
-                        user_id=str(args.user_id),
-                        since_bj=since_bj,
-                        url=_comments_url(str(args.user_id)),
-                        url_contains="/statuses/user/comments.json",
-                        max_batches=int(args.max_comment_pages),
-                        store=comment_store,
-                        seen_ids=seen_comment_ids,
-                        normalize_fn=_normalize_user_comment,
-                        extract_records_fn=_extract_comment_records,
-                        limiter=limiter,
-                        kind_name="comments",
-                    )
-                    wrote_comments = int(comments_result.wrote)
-                    if wrote_comments:
-                        print(f"回复新增写入 {wrote_comments} 条到 SQLite：{db_path}")
-                    elif not comments_result.saw_any and comments_result.html_path:
+                if result != 0:
+                    if total > 1:
                         print(
-                            f"未拦截到回复 JSON，已降级保存 HTML 快照：{comments_result.html_path}",
+                            f"用户 {user_id} 抓取失败。为保护账号，批量任务已停止，后续用户不会继续。",
                             file=sys.stderr,
                         )
+                    return result
 
-                if want_talks:
-                    talks_api = detail_api
-                    try:
-                        wrote_talks = _backfill_talks_since(
-                            api=talks_api,
-                            user_id=str(args.user_id),
-                            since_bj=since_bj,
-                            max_talk_pages=int(args.max_talk_pages),
-                            comments_store=comment_store,
-                            talks_store=talks_store,
-                        )
-                    except ChallengeRequiredError as e:
-                        try:
-                            _wait_for_waf_challenge(
-                                ui_page,
-                                talks_api,
-                                args.user_id,
-                                int(args.login_timeout_sec),
-                                getattr(e, "final_url", e.url),
-                            )
-                            wrote_talks = _backfill_talks_since(
-                                api=talks_api,
-                                user_id=str(args.user_id),
-                                since_bj=since_bj,
-                                max_talk_pages=int(args.max_talk_pages),
-                                comments_store=comment_store,
-                                talks_store=talks_store,
-                            )
-                        except Exception as e2:
-                            had_blocked = True
-                            print(f"查看对话抓取被拦截：{e2}", file=sys.stderr)
-                    except BlockedError as e:
-                        had_blocked = True
-                        print(f"查看对话抓取被拦截：{e}", file=sys.stderr)
-                    except Exception as e:
-                        had_blocked = True
-                        print(f"查看对话抓取失败：{e}", file=sys.stderr)
-                    if wrote_talks:
-                        print(
-                            f"查看对话新增/补齐写入 {wrote_talks} 份到 SQLite：{db_path}"
-                        )
-
-                final_entries = collapse_user_records_to_entries(
-                    db=db,
-                    user_id=str(args.user_id),
-                    resolve_status_line=resolve_status_line,
-                )
-                if final_entries:
-                    print(f"最终展示记录写入 {final_entries} 条到 SQLite：{db_path}")
-
-                if had_blocked and (wrote_statuses + wrote_comments + wrote_talks == 0):
+                if index < total and cooldown_sec > 0:
                     print(
-                        "提示：当前会话下接口暂时不可用。这可能是真正的风控挑战页，也可能是非 JSON/HTML 拦截页。"
-                        "如果程序明确提示需要手动验证，请在 UI 标签页处理后重试；否则优先检查当前会话是否仍能稳定返回 JSON。",
+                        f"用户 {user_id} 已完成，等待 {cooldown_sec:.1f} 秒后继续下一个用户。",
                         file=sys.stderr,
                     )
-                    return 2
-                return 0
-
-            print("当前仅支持 core 模式。", file=sys.stderr)
-            return 2
+                    time.sleep(cooldown_sec)
 
     return 0
 
