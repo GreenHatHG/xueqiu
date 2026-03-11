@@ -1,122 +1,125 @@
-# 雪球用户内容爬取（Playwright 登录态）
+# 雪球用户内容爬取
 
-这个项目的核心思路是：**不做接口签名逆向**，所有取数都尽量留在已登录浏览器会话内完成。当前实现不是单一路径，而是按数据类型做了收敛：`timeline` 固定走“浏览主页 + UI 网络拦截”；`comments` 在默认 Playwright 会话下仍走 UI 拦截，但在 `--cdp` 连接你本机正常 Chrome 时，会优先改为在该浏览器会话里直接请求 `/statuses/user/comments.json` 并按 `max_id` 游标翻页。若目标 JSON 完全拿不到，则降级为保存 HTML 留痕。更完整的接口与数据流转记录见 `docs/数据流转与抓取说明.md`。
+这个项目现在只走一条主路：
+
+- 先准备一份“基础浏览器资料目录”
+- 第一次在这个目录里手动登录一次雪球
+- 后面每抓一个用户，程序都会先复制一份新的资料目录
+- 再用这份新目录起一个新的 Chrome 去抓
+
+这样做的目的很直接：前面某个用户把浏览器会话跑脏了，也别污染后面的用户。
 
 ## 1. 安装
 
-推荐使用 `uv`（本仓库已包含 `uv.lock`）：
+推荐用 `uv`：
 
-1）同步依赖并创建虚拟环境：
+1）同步依赖：
 
 `uv sync`
 
-2）安装 Playwright 浏览器（首次需要）：
+2）首次装 Playwright 浏览器：
 
 `uv run python -m playwright install chromium`
 
-## 2. 首次登录（只需要一次）
+## 2. 基础浏览器资料目录
 
-本项目默认使用 Playwright 的 **persistent context**，把登录态保存在 `./.playwright/user-data/`。第一次运行会打开一个可见浏览器窗口；你在窗口里手动登录雪球一次，后续运行会自动复用登录态，不需要重复登录。
+默认基础目录是 `./.playwright/user-data/`。
 
-如果你看到“等待登录/可能出现验证码”的提示，说明当前登录态不可用：请在打开的浏览器窗口完成登录（或处理验证码），程序会继续执行。
+第一次运行时，程序会先用这个目录起一个 Chrome。如果还没登录，你就在打开的窗口里手动登录雪球一次。后面再跑，就继续拿这份目录当“母本”。
 
-注意：即使你“看起来已登录”，自动化浏览器也可能被风控导致 JSON 接口不可用；此时程序会提示并继续尝试抓取，若持续失败可参考下方的反自动化处理建议。
+重点是：
 
-## 3. 运行示例（核心默认：只需 user_id + 截止时间）
+- 这份目录不是直接给所有用户共用跑到尾
+- 它只是“母本”
+- 真正抓每个用户时，程序都会先复制一份新的目录再起新的浏览器
 
-你最常用的场景只需要两件事：博主自己发的内容（时间线 statuses）和博主在全站的所有回复（comments），并且为每条回复抓取“查看对话”（talks）以还原上下文。为此 CLI 默认改为 `core` 模式：你只需要提供 `--user-id` 与 `--since`（截止时间），其余都按程序默认“能抓就尽量抓”，并在遇到更早内容时自动停止回溯。
+如果你怀疑这份母本已经脏了，最简单的办法就是换个新目录重新登录一次，比如：
 
-最小可用（先跑通流程，再逐步把 since 往更早挪）：
+`uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06 --user-data-dir .playwright/user-data-2`
 
-`uv run xq-crawl --user-id 9650668145 --since 2026-03-06`
+## 3. 运行方式
 
-如果你想按用户列表顺序抓取，并统一写入一个 SQLite，可先准备一个 UTF-8 文本文件（每行一个用户 ID，空行与以 `#` 开头的注释行会忽略），例如：
+现在只收 `--user-list-file`，不再收 `--user-id`。
+
+就算你只想跑一个用户，也是在文件里放一行，比如：
 
 ```text
 9650668145
-# 下面继续追加别的用户
-1234567890
 ```
 
 然后执行：
 
 `uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06`
 
-批量模式默认会把所有用户写入同一个数据库 `data/xueqiu_batch.sqlite3`，并在相邻两个用户之间额外等待 `60` 秒。你也可以显式指定统一库路径，或调整等待时间：
+如果你要跑多个用户，文件就一行一个：
 
-`uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06 --db data/my_batch.sqlite3 --user-cooldown-sec 90`
+```text
+9650668145
+1234567890
+```
 
-补充说明：当前 `timeline` 会全自动打开用户主页并通过滚动/翻页触发页面自身请求，再在浏览器侧拦截 `/v4/statuses/user_timeline.json` 的响应落盘；`comments` 在默认会话下仍采用类似方式，但如果你用了 `--cdp` 连接本机正常 Chrome，则会优先在该浏览器会话内直接请求 `/statuses/user/comments.json?user_id=...&size=...&max_id=...`。若在一定窗口内完全拿不到目标 JSON，会在 `data/html/{user_id}/` 写入 HTML 快照并提示你已降级留痕（避免静默失败）。core 模式默认也会尽量补齐每条回复的“查看对话”（talks）；如果你只要主干数据，可加 `--no-talks`。
+常用例子：
 
-如果你遇到风控导致抓取或 talks 补齐失败，优先使用 `--cdp` 连接你本机正常 Chrome Profile（更接近日常浏览，尤其对 `comments` 的 direct fetch 更稳）。
+- 最小可用：
+  `uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06`
+- 指定统一数据库：
+  `uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06 --db data/my_batch.sqlite3`
+- 调大两个用户之间的等待：
+  `uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06 --user-cooldown-sec 90`
+- 跳过登录检查（不推荐）：
+  `uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06 --skip-login-check`
+- 出现 `alichlgref` / `md5__1038` 这种跳转时：
+  `uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06 --reduce-automation-fingerprint`
 
 说明：
 
-- `--since 2026-03-06` 表示按 `Asia/Shanghai` 的本地日期，从最新向历史回溯抓取 **>= 2026-03-06** 的内容；如果你想精确到时刻，也可以用 ISO 8601（例如 `2026-03-06T00:00:00+08:00`）。
-- 你担心的“回复页只有问答片段、不知道挂在哪条博文下”，会通过 SQLite 的 `comments` 表里的 `root_status_url/root_status_id/root_status_target` 直接解决：每条回复都会带可还原定位信息。
-- “查看对话”可能很长。程序会把 talks 的聚合结果写入 SQLite 的 `talks` 表（`raw_json` 字段保存原始 JSON 文本），并支持你重复运行来继续补齐（例如提高 `--max-talk-pages` 后可继续把同一条对话链补全）。
-- 如果你遇到“为保证正常访问请验证/验证失败，请刷新重试”，请在打开的 UI 标签页里完成验证码/挑战（必要时刷新雪球首页）。为避免反复刷新触发更严风控，程序会暂停重试并提示你“完成验证后按回车继续”。
+- `--since 2026-03-06` 表示按 `Asia/Shanghai` 往回抓，只保留 `>= 2026-03-06` 的内容
+- `timeline` 还是走主页浏览 + 页面拦截，但现在会记住已经跑过的批次，停掉后会先快进再继续
+- `comments` 会优先在当前浏览器会话里直接拿数据；如果重试后还是不对，或者根本没拿到回复 JSON，会留 HTML 快照
+- `talks` 默认会尽量补
 
-如果打开网页后出现 `alichlgref` / `md5__1038` 参数的无限跳转（疑似风控/反自动化挑战），先试：
+## 4. 每个用户的新浏览器
 
-`uv run xq-crawl --user-id 9650668145 --since 2026-03-06 --reduce-automation-fingerprint`
+程序现在会这样跑：
 
-必要时也可以换一个全新的登录态目录重新登录一次（避免旧目录被风控状态污染）：
+1）先检查基础浏览器资料目录能不能登录
+2）开始抓某个用户前，先复制一份新的资料目录
+3）用这份新目录起一个新的 Chrome
+4）抓完这个用户就关掉这个 Chrome
 
-`uv run xq-crawl --user-id 9650668145 --user-data-dir .playwright/user-data-2 --since 2026-03-06 --reduce-automation-fingerprint`
+临时目录默认放在：
 
-如果你确信已登录，并且不想被“登录/风控探测”阻塞流程，可用（不推荐）：
+`data/browser_profiles/<时间戳>/`
 
-`uv run xq-crawl --user-id 9650668145 --skip-login-check --since 2026-03-06`
+规则是：
 
-输出默认写到 `data/`：
+- 抓成功：临时目录会尽量删掉
+- 抓失败：临时目录先保留，日志里会把路径打出来，方便你查
 
-- `data/xueqiu_{user_id}.sqlite3`：唯一主输出（SQLite 数据库，最终只保留可直接阅读的展示记录；每一行要么是单独原博文，要么是一整条评论链，原始来源数据保存在 `payload_json` 中）
-- `data/xueqiu_batch.sqlite3`：批量模式的默认统一输出库；同一个库里通过 `user_id` 字段区分不同用户
-- `data/html/{user_id}/`：当未能拦截到目标 JSON 响应时，降级保存 HTML 快照（用于诊断风控/页面结构变化）
+## 5. 输出
 
-查看结果时，建议优先直接看表里的 `text` 字段；如果后续需要追溯这条记录来自哪条 status/comment/talk，再看同一行里的 `payload_json`。
+默认输出在 `data/`：
 
-## 4. 反爬/账号安全（建议不要改得太激进）
+- `data/xueqiu_batch.sqlite3`：默认统一数据库
+- `data/html/{user_id}/`：拿不到目标 JSON 时保存的网页快照
+- `data/browser_profiles/<时间戳>/`：本次运行时每个用户的临时浏览器目录
 
-程序默认启用：
+看结果时，先看表里的 `text` 字段就行；要追原始内容，再看同一行的 `payload_json`。
 
-- 单页面串行请求（不并发）
-- 请求间最小延迟 + 随机抖动
-- 批量模式下，用户与用户之间额外冷却等待（默认 `--user-cooldown-sec 60`）
-- 429/403/返回 HTML（挑战页）视为风控信号：指数退避重试，达到阈值自动停止并落盘断点
-- 批量模式中只要某个用户出现高风险拦截或登录态问题，默认停止后续用户，避免继续冲撞
-- SQLite 内置缓存表（同一 DB 文件中）减少重复访问
+但要注意：
 
-你可以用这些参数更保守或更激进，但不建议把延迟降得太低：
+- `text` 现在不是“全清洗后的纯文本”
+- 目前只会顺手处理一小部分 HTML：去掉 `<a ...>` 包裹但保留里面的字，把 `<br>` 变成换行，把雪球表情那种 `<img ...>` 换成对应文字
+- 像 `<p>`、`<strong>`、`<figure>`、大部分普通 `<img>` 这类标签，现在还可能保留在 `text` 里
+- 所以后面如果你要拿 `text` 去做搜索、分析、喂模型，最好再做一层你自己的正文清洗
 
-- `--min-delay 1.2 --jitter 0.6`
-- `--max-retries 2 --max-consecutive-blocks 3`
+## 6. 风控和稳定性
 
-## 5. 可选：连接你正在调试的 Chrome（CDP attach）
+程序默认是偏保守的：
 
-如果你希望“就是同一个调试浏览器继续跑”，可以让爬虫直接连接一个已启动的 Chrome（需要你手动以 remote debugging port 启动）。
+- 单线程顺着抓
+- 每次请求有最小等待和随机抖动
+- 两个用户之间还会额外等一会儿
+- 某个用户如果已经明显出问题，默认会停掉后面的用户
 
-这也是目前最接近“用本地正常浏览器”的方式：你用自己的 Chrome + 自己的 Profile 登录并通过风控挑战，爬虫只负责连接到这个会话继续抓取。当前代码下，`timeline` 在 CDP 模式中仍然保持 UI 拦截；`comments` 则会优先在同一浏览器会话里直接请求接口并按 `max_id` 翻页。
-
-更详细的操作步骤与注意事项见：`docs/使用本地Chrome(CDP)操作指南.md`。
-
-示例（请自行根据系统调整 Chrome 启动方式与参数）：
-
-- 启动 Chrome 时加 `--remote-debugging-port=9222`（macOS 还必须加一个非默认的 `--user-data-dir`，否则不会真正监听端口）
-- 然后运行：
-
-`xq-crawl --user-id 9650668145 --cdp http://127.0.0.1:9222 --since 2026-03-06`
-
-注意：CDP attach 会受到你当前 Chrome Profile、扩展、锁文件等影响，稳定性与可控性通常不如默认的 persistent context；除非你明确需要“同一个调试窗口”，否则建议用默认方式。
-
-如果你想先单独验证当前 Chrome 会话里 direct fetch 是否稳定，再决定是否用 `--cdp` 跑主流程，可以执行：
-
-`./.venv/bin/python scripts/test_cdp_fetch.py --cdp http://127.0.0.1:9222 --user-id 9650668145`
-
-脚本会分别验证：
-
-- timeline 同参重复请求是否稳定；
-- timeline 跨页是否真的变化；
-- comments 首批请求与 `next_max_id` 后续批次是否真的变化；
-- 是否中途出现 HTML / 疑似挑战页。
+如果你看到“请手动验证”之类的话，就去打开的浏览器窗口里把验证处理完，再回来按回车继续。

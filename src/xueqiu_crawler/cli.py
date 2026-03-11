@@ -3,16 +3,18 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import os
+import subprocess
+import shutil
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import parse_qs, urlparse
 
 from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 from .constants import (
     BASE_URL,
@@ -21,7 +23,6 @@ from .constants import (
     DEFAULT_BATCH_USER_COOLDOWN_SEC,
     DEFAULT_CORE_MAX_USER_COMMENTS_SCAN_PAGES,
     DEFAULT_CORE_MAX_TALK_PAGES,
-    DEFAULT_DB_BASENAME,
     DEFAULT_JITTER_SEC,
     DEFAULT_MAX_CONSECUTIVE_BLOCKS,
     DEFAULT_MAX_RETRIES,
@@ -31,10 +32,12 @@ from .constants import (
     USER_COMMENTS_PAGE_SIZE,
 )
 from .storage import (
+    SqliteCrawlProgressStore,
     SqliteDb,
     SqliteMergedCommentsStore,
     SqliteMergedStatusesStore,
     SqliteMergedTalksStore,
+    SqliteTalksProgressStore,
     collapse_user_records_to_entries,
 )
 from .text_sanitize import sanitize_xueqiu_text
@@ -55,6 +58,42 @@ UI_INTERCEPT_MAX_IDLE_ROUNDS = 6
 UI_INTERCEPT_ROUNDS_PER_BATCH = 30
 UI_INTERCEPT_PAGE_TURN_TIMEOUT_SEC = 8.0
 UI_INTERCEPT_PAGE_TURN_SETTLE_SEC = 2.0
+LOGIN_STATE_CHECK_INTERVAL_SEC = 4.0
+LOGIN_STATE_CONFIRM_SETTLE_SEC = 2.0
+BASE_PROFILE_COPY_SETTLE_SEC = 2.0
+LOGIN_HOME_TITLE_TEXT = "我的首页"
+LOGIN_POST_BUTTON_TEXT = "发帖"
+LOGIN_UI_STRONG_SIGNAL_NAMES = frozenset(
+    {
+        "post_button",
+        "user_name",
+        "editor_placeholder",
+        "logout_link",
+        "settings_link",
+    }
+)
+LOGIN_UI_SIGNAL_LABELS = {
+    "home_title": "首页标题",
+    "post_button": "发帖按钮",
+    "user_name": "用户名字",
+    "editor_placeholder": "发帖输入框",
+    "logout_link": "退出账号",
+    "settings_link": "个人设置",
+}
+BROWSER_PROFILE_RUNS_DIRNAME = "browser_profiles"
+BROWSER_PROFILE_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%S_%f"
+BROWSER_PROFILE_COPY_IGNORE_PATTERNS = (
+    "SingletonLock",
+    "SingletonSocket",
+    "SingletonCookie",
+    "DevToolsActivePort",
+    "*.lock",
+    "*.tmp",
+)
+PROGRESS_STAGE_TIMELINE = "timeline"
+PROGRESS_STAGE_COMMENTS = "comments"
+PROGRESS_STAGE_TALKS = "talks"
+PROGRESS_STAGE_FINALIZE = "finalize"
 
 
 def _beijing_iso_now() -> str:
@@ -67,14 +106,44 @@ def _format_progress_dt(value: Optional[dt.datetime]) -> str:
     return value.astimezone(BEIJING_TIMEZONE).replace(microsecond=0).isoformat(sep=" ")
 
 
+def _user_has_entry_rows(*, db: SqliteDb, user_id: str) -> bool:
+    row = db.conn.execute(
+        """
+        SELECT 1
+        FROM merged_records
+        WHERE user_id = ? AND merge_key LIKE 'entry:%'
+        LIMIT 1
+        """,
+        (str(user_id),),
+    ).fetchone()
+    return bool(row)
+
+
+def _user_has_raw_rows(*, db: SqliteDb, user_id: str) -> bool:
+    row = db.conn.execute(
+        """
+        SELECT 1
+        FROM merged_records
+        WHERE user_id = ?
+          AND (
+            merge_key LIKE 'status:%'
+            OR merge_key LIKE 'comment:%'
+            OR merge_key LIKE 'talk:%'
+          )
+        LIMIT 1
+        """,
+        (str(user_id),),
+    ).fetchone()
+    return bool(row)
+
+
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="xq-crawl")
-    user_group = p.add_mutually_exclusive_group(required=True)
-    user_group.add_argument("--user-id", help="雪球用户ID，例如 9650668145")
-    user_group.add_argument(
+    p.add_argument(
         "--user-list-file",
         type=Path,
-        help="批量用户列表文件路径（UTF-8 文本；每行一个用户ID，空行与 # 注释行会忽略）",
+        required=True,
+        help="用户列表文件路径（UTF-8 文本；每行一个用户ID，空行与 # 注释行会忽略）",
     )
     p.add_argument(
         "--mode",
@@ -95,9 +164,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "SQLite 数据库文件路径（单用户默认：{out}/"
-            f"{DEFAULT_DB_BASENAME}；"
-            f"批量默认：{{out}}/{DEFAULT_BATCH_DB_BASENAME}）。"
+            f"SQLite 数据库文件路径（默认 {{out}}/{DEFAULT_BATCH_DB_BASENAME}）。"
             "本项目已切换为“只落库”，不再生成 JSONL/CSV/JSON 文件。"
         ),
     )
@@ -155,7 +222,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--max-retries",
         type=int,
         default=DEFAULT_MAX_RETRIES,
-        help="单请求最大重试次数",
+        help="单请求最大重试次数；像第一页空列表这种明显不对的回包也会重试",
     )
     p.add_argument(
         "--max-consecutive-blocks",
@@ -167,10 +234,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--user-cooldown-sec",
         type=float,
         default=DEFAULT_BATCH_USER_COOLDOWN_SEC,
-        help=(
-            "批量模式下，相邻两个用户之间额外等待的秒数"
-            f"（默认 {DEFAULT_BATCH_USER_COOLDOWN_SEC}；单用户模式忽略）"
-        ),
+        help=f"相邻两个用户之间额外等待的秒数（默认 {DEFAULT_BATCH_USER_COOLDOWN_SEC}）",
     )
 
     p.add_argument(
@@ -180,20 +244,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--user-data-dir",
         type=Path,
         default=DEFAULT_USER_DATA_DIR,
-        help="Playwright 持久化用户数据目录",
+        help="基础浏览器资料目录。第一次会在这里登录，后面每个用户都会先复制一份新的目录再抓。",
     )
     p.add_argument(
-        "--chrome-channel", default="chrome", help="Playwright channel（默认 chrome）"
+        "--chrome-channel",
+        default="chrome",
+        help="Chrome 可执行名字或路径（默认 chrome）",
     )
     p.add_argument(
         "--reduce-automation-fingerprint",
         action="store_true",
         help="启用最小的自动化指纹减弱（若出现 alichlgref/md5__1038 无限跳转，建议开启）",
-    )
-    p.add_argument(
-        "--cdp",
-        default=None,
-        help="连接现有 Chrome 的 CDP 地址，例如 http://127.0.0.1:9222 （可选）",
     )
     p.add_argument(
         "--login-timeout-sec",
@@ -204,18 +265,100 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _has_login_cookie(page) -> bool:
+def _get_login_ui_signal_names(page) -> set[str]:
     try:
-        cookies = page.context.cookies(BASE_URL)
+        signal_names = page.evaluate(
+            """
+            () => {
+              const isVisible = (node) => {
+                if (!node) {
+                  return false;
+                }
+                const style = window.getComputedStyle(node);
+                if (!style) {
+                  return false;
+                }
+                if (style.display === 'none' || style.visibility === 'hidden') {
+                  return false;
+                }
+                if (Number(style.opacity || '1') === 0) {
+                  return false;
+                }
+                const rect = node.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+              };
+
+              const signalNames = [];
+              const title = (document.title || '').trim();
+              if (title.includes(%r)) {
+                signalNames.push('home_title');
+              }
+
+              const postButton = document.querySelector('.user__col-btn-status > button');
+              if (
+                postButton &&
+                isVisible(postButton) &&
+                (postButton.textContent || '').trim().includes(%r)
+              ) {
+                signalNames.push('post_button');
+              }
+
+              const userName = document.querySelector('#side_user_name, .user__col--name');
+              if (userName && isVisible(userName)) {
+                signalNames.push('user_name');
+              }
+
+              const editorPlaceholder = document.querySelector('.editor-container .fake-placeholder');
+              if (editorPlaceholder && isVisible(editorPlaceholder)) {
+                signalNames.push('editor_placeholder');
+              }
+
+              const logoutLink = document.querySelector("a[href*='/snowman/logout']");
+              if (logoutLink && isVisible(logoutLink)) {
+                signalNames.push('logout_link');
+              }
+
+              const settingsLink = document.querySelector("a[href='/setting/user']");
+              if (settingsLink && isVisible(settingsLink)) {
+                signalNames.push('settings_link');
+              }
+
+              return signalNames;
+            }
+            """
+            % (LOGIN_HOME_TITLE_TEXT, LOGIN_POST_BUTTON_TEXT)
+        )
     except Exception:
-        return False
-    names = {c.get("name") for c in cookies if isinstance(c, dict)}
-    return bool(names.intersection({"xq_a_token", "xq_r_token", "xq_id_token", "u"}))
+        return set()
+
+    names: set[str] = set()
+    for name in signal_names or []:
+        key = str(name or "").strip()
+        if key:
+            names.add(key)
+    return names
+
+
+def _is_confirmed_logged_in(*, ui_signal_names: set[str]) -> bool:
+    return bool(ui_signal_names.intersection(LOGIN_UI_STRONG_SIGNAL_NAMES))
+
+
+def _format_login_state(ui_signal_names: set[str]) -> str:
+    ui_parts = [
+        label
+        for name, label in LOGIN_UI_SIGNAL_LABELS.items()
+        if name in ui_signal_names
+    ]
+    ui_parts.extend(
+        sorted(name for name in ui_signal_names if name not in LOGIN_UI_SIGNAL_LABELS)
+    )
+    ui_text = ", ".join(ui_parts) if ui_parts else "-"
+    return f"页面: {ui_text}"
 
 
 def _ensure_logged_in_ui(page, timeout_sec: int) -> None:
     """
-    UI 拦截模式下不做“程序侧直连接口探测”，只基于页面与 cookie 做保守等待。
+    UI 拦截模式下不做“程序侧直连接口探测”，只基于页面痕迹做保守等待。
 
     说明：登录/滑动验证码很难在不触发更强风控的前提下全自动完成，因此这里只做“自动等待已有登录态”，
     如果未登录则需要你在弹出的浏览器里手动登录一次（之后 persistent context 会复用）。
@@ -226,18 +369,27 @@ def _ensure_logged_in_ui(page, timeout_sec: int) -> None:
     except Exception:
         pass
 
-    if _has_login_cookie(page):
+    ui_signal_names = _get_login_ui_signal_names(page)
+    if _is_confirmed_logged_in(ui_signal_names=ui_signal_names):
         return
 
     print(
-        "当前浏览器上下文未检测到登录 cookie。请在打开的浏览器窗口里手动登录雪球一次。",
+        "当前浏览器里还没看出已经登录。请在打开的浏览器窗口里手动登录雪球一次。",
         file=sys.stderr,
     )
     deadline = time.time() + float(timeout_sec)
     while time.time() < deadline:
-        time.sleep(4)
-        if _has_login_cookie(page):
-            print("检测到登录 cookie，继续执行自动化浏览与拦截取数。", file=sys.stderr)
+        time.sleep(LOGIN_STATE_CHECK_INTERVAL_SEC)
+        ui_signal_names = _get_login_ui_signal_names(page)
+        if _is_confirmed_logged_in(ui_signal_names=ui_signal_names):
+            time.sleep(LOGIN_STATE_CONFIRM_SETTLE_SEC)
+            ui_signal_names = _get_login_ui_signal_names(page)
+            if not _is_confirmed_logged_in(ui_signal_names=ui_signal_names):
+                continue
+            print(
+                f"检测到已登录痕迹（{_format_login_state(ui_signal_names)}），继续执行自动化浏览与拦截取数。",
+                file=sys.stderr,
+            )
             return
     raise RuntimeError(f"等待登录超时（{timeout_sec}s），为保护账号已停止。")
 
@@ -284,7 +436,7 @@ def _wait_for_waf_challenge(
     )
     print(
         "如果该自动化浏览器一直验证失败，通常需要改用你日常 Chrome Profile："
-        "用 --cdp 连接一个手工启动的 Chrome（见 docs/使用本地Chrome(CDP)操作指南.md）。",
+        "先换一份全新的基础浏览器资料目录，重新登录后再跑。",
         file=sys.stderr,
     )
 
@@ -507,6 +659,147 @@ def _page_signature(page) -> str:
         return str(obj or "")
 
 
+def _active_pagination_page(page) -> int:
+    try:
+        value = page.evaluate(
+            """
+            () => {
+              const active = document.querySelector(
+                '.pagination .active, .pagination__item.active, .pagination__item.current, .pagination__page.active, .pagination__current'
+              );
+              return active ? String(active.textContent || '').trim() : '';
+            }
+            """
+        )
+    except Exception:
+        return 0
+    try:
+        return int(str(value or "").strip())
+    except Exception:
+        return 0
+
+
+def _timeline_page_from_url(url: str) -> int:
+    try:
+        parsed = urlparse(str(url or ""))
+        value = parse_qs(parsed.query).get("page", [""])[0]
+        return int(str(value or "").strip())
+    except Exception:
+        return 0
+
+
+def _wait_for_timeline_page_change(
+    page,
+    *,
+    stats: "_UiInterceptStats",
+    previous_signature: str,
+    previous_batches: int,
+    target_page: int,
+) -> bool:
+    deadline = time.time() + UI_INTERCEPT_PAGE_TURN_TIMEOUT_SEC
+    while time.time() < deadline:
+        time.sleep(0.5)
+        current_page = _active_pagination_page(page)
+        if current_page > 0:
+            stats.current_page_number = int(current_page)
+        if int(current_page) == int(target_page):
+            _scroll_to_top(page)
+            print(
+                f"[{stats.kind_name}] 已跳到第 {target_page} 页。",
+                file=sys.stderr,
+            )
+            return True
+        if int(stats.captured_batches) > previous_batches:
+            current_page = _active_pagination_page(page)
+            if current_page > 0:
+                stats.current_page_number = int(current_page)
+            if int(stats.current_page_number or 0) == int(target_page):
+                _scroll_to_top(page)
+                print(
+                    f"[{stats.kind_name}] 已跳到第 {target_page} 页，并收到新批次。",
+                    file=sys.stderr,
+                )
+                return True
+        if _page_signature(page) != previous_signature and int(
+            stats.current_page_number or 0
+        ) == int(target_page):
+            _scroll_to_top(page)
+            print(
+                f"[{stats.kind_name}] 已跳到第 {target_page} 页。",
+                file=sys.stderr,
+            )
+            return True
+    return False
+
+
+def _jump_to_timeline_page_and_wait(
+    page, *, stats: "_UiInterceptStats", target_page: int
+) -> bool:
+    target = max(1, int(target_page))
+    if target <= 1:
+        return True
+    previous_signature = _page_signature(page)
+    previous_batches = int(stats.captured_batches)
+
+    try:
+        clicked = bool(
+            page.evaluate(
+                """
+                (pageText) => {
+                  const links = Array.from(document.querySelectorAll('.pagination a'));
+                  const target = links.find((el) => String(el.textContent || '').trim() === pageText);
+                  if (!target) return false;
+                  target.scrollIntoView({ block: 'center' });
+                  target.click();
+                  return true;
+                }
+                """,
+                str(target),
+            )
+        )
+    except Exception:
+        clicked = False
+
+    if clicked and _wait_for_timeline_page_change(
+        page,
+        stats=stats,
+        previous_signature=previous_signature,
+        previous_batches=previous_batches,
+        target_page=target,
+    ):
+        return True
+
+    try:
+        input_locator = page.locator(".pagination input").first
+        if input_locator.count() == 0:
+            return False
+        input_locator.scroll_into_view_if_needed()
+        input_locator.click(timeout=3000)
+        input_locator.evaluate(
+            """
+            (el) => {
+              el.focus();
+              el.value = '';
+              try {
+                el.setSelectionRange(0, String(el.value || '').length);
+              } catch (e) {}
+            }
+            """
+        )
+        page.keyboard.type(str(target))
+        page.keyboard.press("Enter")
+    except Exception:
+        return False
+
+    return _wait_for_timeline_page_change(
+        page,
+        stats=stats,
+        previous_signature=previous_signature,
+        previous_batches=previous_batches,
+        target_page=target,
+    )
+
+
 def _click_next_page_and_wait(page, *, stats: "_UiInterceptStats") -> bool:
     print(
         f"[{stats.kind_name}] 这一页没新数据了，准备翻页；已扫到最旧日期 {_format_progress_dt(stats.last_batch_oldest)}",
@@ -557,16 +850,65 @@ def _click_next_page_and_wait(page, *, stats: "_UiInterceptStats") -> bool:
     while time.time() < deadline:
         time.sleep(0.5)
         if int(stats.captured_batches) > previous_batches:
+            current_page = _active_pagination_page(page)
+            if current_page > 0:
+                stats.current_page_number = int(current_page)
             _scroll_to_top(page)
             print(f"[{stats.kind_name}] 下一页已触发并收到新批次。", file=sys.stderr)
             return True
         if _page_signature(page) != previous_signature:
+            current_page = _active_pagination_page(page)
+            if current_page > 0:
+                stats.current_page_number = int(current_page)
             _scroll_to_top(page)
             print(f"[{stats.kind_name}] 下一页已打开。", file=sys.stderr)
             return True
 
     print(f"[{stats.kind_name}] 下一页未打开或未产生新批次。", file=sys.stderr)
     return False
+
+
+def _fast_forward_ui_batches(
+    page, *, stats: "_UiInterceptStats", target_batches: int
+) -> None:
+    target = max(0, int(target_batches))
+    if target <= 0:
+        return
+    if int(stats.captured_batches) >= target:
+        return
+    if str(stats.stage_name or "") == PROGRESS_STAGE_TIMELINE:
+        target_page = max(1, int(target))
+        print(
+            f"[{stats.kind_name}] 发现断点，先跳到第 {target_page} 页附近。",
+            file=sys.stderr,
+        )
+        if _jump_to_timeline_page_and_wait(page, stats=stats, target_page=target_page):
+            return
+        print(
+            f"[{stats.kind_name}] 直接跳页没成功，改走下一页快进。",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"[{stats.kind_name}] 发现断点，先快进到第 {target + 1} 批前面。",
+            file=sys.stderr,
+        )
+    max_steps = max(target * 2 + 4, 8)
+    steps = 0
+    while int(stats.captured_batches) < target and steps < max_steps:
+        steps += 1
+        if not _click_next_page_and_wait(page, stats=stats):
+            print(
+                f"[{stats.kind_name}] 快进没到目标位置，只走到了第 {stats.captured_batches} 批，后面从这里继续。",
+                file=sys.stderr,
+            )
+            return
+        time.sleep(UI_INTERCEPT_PAGE_TURN_SETTLE_SEC)
+    if int(stats.captured_batches) >= target:
+        print(
+            f"[{stats.kind_name}] 快进完成，当前已到第 {stats.captured_batches} 批。",
+            file=sys.stderr,
+        )
 
 
 @dataclass
@@ -580,6 +922,10 @@ class _UiInterceptStats:
     kind_name: str
     kind: Callable[[dict[str, Any], str], dict[str, Any]]
     extract_records: Any
+    progress_store: Any = None
+    since_bj_iso: str = ""
+    stage_name: str = ""
+    current_page_number: int = 0
 
     seen_urls: set[str] = field(default_factory=set)
     wrote: int = 0
@@ -635,6 +981,9 @@ def _make_ui_response_handler(stats: _UiInterceptStats):
         stats.saw_any = True
         stats.last_hit_ts = time.time()
         stats.captured_batches += 1
+        page_num = _timeline_page_from_url(url)
+        if page_num > 0:
+            stats.current_page_number = int(page_num)
 
         records, batch_oldest = stats.extract_records(obj)
         batch_newest: Optional[dt.datetime] = None
@@ -663,6 +1012,27 @@ def _make_ui_response_handler(stats: _UiInterceptStats):
             stats.wrote += stats.store.append_many(to_write)
 
         stats.last_batch_oldest = batch_oldest
+        if stats.progress_store is not None and stats.since_bj_iso and stats.stage_name:
+            progress_index = int(stats.captured_batches)
+            progress_cursor = str(stats.captured_batches)
+            if (
+                str(stats.stage_name) == PROGRESS_STAGE_TIMELINE
+                and int(stats.current_page_number or 0) > 0
+            ):
+                progress_index = int(stats.current_page_number)
+                progress_cursor = str(stats.current_page_number)
+            stats.progress_store.upsert(
+                since_bj_iso=str(stats.since_bj_iso),
+                stage=str(stats.stage_name),
+                status="running",
+                cursor_text=progress_cursor,
+                current_index=progress_index,
+                total_count=int(stats.max_batches) if int(stats.max_batches) > 0 else 0,
+                detail={
+                    "last_oldest_bj": batch_oldest.isoformat() if batch_oldest else "",
+                    "last_newest_bj": batch_newest.isoformat() if batch_newest else "",
+                },
+            )
         print(
             f"[{stats.kind_name}] 批次 {stats.captured_batches}: 原始 {len(records)} 条, 新增 {len(to_write)} 条, "
             f"日期 {_format_progress_dt(batch_newest)} -> {_format_progress_dt(batch_oldest)}",
@@ -721,6 +1091,9 @@ def _crawl_via_ui_intercept(
     extract_records_fn,
     limiter: RateLimiter,
     kind_name: str,
+    progress_store: Any = None,
+    since_bj_iso: str = "",
+    stage_name: str = "",
 ) -> _UiCrawlResult:
     """
     全自动页面浏览 + 网络拦截取数。
@@ -738,10 +1111,20 @@ def _crawl_via_ui_intercept(
         kind_name=str(kind_name),
         kind=normalize_fn,
         extract_records=extract_records_fn,
+        progress_store=progress_store,
+        since_bj_iso=str(since_bj_iso or ""),
+        stage_name=str(stage_name or ""),
     )
     handler = _make_ui_response_handler(stats)
     page.on("response", handler)
     try:
+        resume_batches = 0
+        if progress_store is not None and since_bj_iso and stage_name:
+            checkpoint = progress_store.get(
+                since_bj_iso=str(since_bj_iso), stage=str(stage_name)
+            )
+            if checkpoint and checkpoint.get("status") != "completed":
+                resume_batches = int(checkpoint.get("current_index") or 0)
         print(
             f"[{kind_name}] 开始抓取：since={_format_progress_dt(since_bj)}",
             file=sys.stderr,
@@ -757,6 +1140,11 @@ def _crawl_via_ui_intercept(
         time.sleep(2.0)
         if stats.last_hit_ts <= 0:
             stats.last_hit_ts = time.time()
+        current_page = _active_pagination_page(page)
+        if current_page > 0:
+            stats.current_page_number = int(current_page)
+        if resume_batches > 0:
+            _fast_forward_ui_batches(page, stats=stats, target_batches=resume_batches)
 
         # Avoid unbounded scrolling when the UI does not trigger target requests.
         max_rounds = (
@@ -802,6 +1190,27 @@ def _crawl_via_ui_intercept(
             html_path = _write_html_snapshot(
                 out_dir, user_id=str(user_id), kind=kind_name, page=page
             )
+        if progress_store is not None and since_bj_iso and stage_name:
+            progress_index = int(stats.captured_batches)
+            progress_cursor = str(stats.captured_batches)
+            if (
+                str(stage_name) == PROGRESS_STAGE_TIMELINE
+                and int(stats.current_page_number or 0) > 0
+            ):
+                progress_index = int(stats.current_page_number)
+                progress_cursor = str(stats.current_page_number)
+            progress_store.mark_completed(
+                since_bj_iso=str(since_bj_iso),
+                stage=str(stage_name),
+                cursor_text=progress_cursor,
+                current_index=progress_index,
+                total_count=progress_index,
+                detail={
+                    "last_oldest_bj": stats.last_batch_oldest.isoformat()
+                    if stats.last_batch_oldest
+                    else ""
+                },
+            )
         print(
             f"[{kind_name}] 抓取结束：拦截批次 {stats.captured_batches}，新增写入 {stats.wrote} 条，"
             f"最旧日期 {_format_progress_dt(stats.last_batch_oldest)}",
@@ -829,6 +1238,9 @@ def _crawl_comments_via_api(
     max_pages: int,
     store: Any,
     seen_ids: set[str],
+    progress_store: Any,
+    since_bj_iso: str,
+    stage_name: str,
 ) -> tuple[int, Optional[dt.datetime], int]:
     page_limit = (
         int(max_pages)
@@ -836,7 +1248,40 @@ def _crawl_comments_via_api(
         else DEFAULT_CORE_MAX_USER_COMMENTS_SCAN_PAGES
     )
     if page_limit <= 0:
+        progress_store.mark_completed(
+            since_bj_iso=since_bj_iso,
+            stage=stage_name,
+            total_count=0,
+        )
         return 0, None, 0
+
+    checkpoint = progress_store.get(since_bj_iso=since_bj_iso, stage=stage_name)
+    resume_page_count = 0
+    start_max_id = -1
+    if checkpoint and checkpoint.get("status") != "completed":
+        resume_page_count = int(checkpoint.get("current_index") or 0)
+        cursor_text = str(checkpoint.get("cursor_text") or "").strip()
+        if cursor_text:
+            try:
+                start_max_id = int(cursor_text)
+            except Exception:
+                start_max_id = -1
+        if resume_page_count > 0:
+            print(
+                f"[comments-api] 发现断点，从第 {resume_page_count + 1} 批继续。上次 next_max_id={start_max_id}",
+                file=sys.stderr,
+            )
+
+    remaining_pages = max(0, page_limit - resume_page_count)
+    if remaining_pages == 0:
+        progress_store.mark_completed(
+            since_bj_iso=since_bj_iso,
+            stage=stage_name,
+            cursor_text=str(start_max_id),
+            current_index=resume_page_count,
+            total_count=page_limit,
+        )
+        return 0, None, resume_page_count
 
     print(
         f"[comments-api] 开始抓取：since={_format_progress_dt(since_bj)}",
@@ -844,9 +1289,9 @@ def _crawl_comments_via_api(
     )
     wrote = 0
     oldest_seen: Optional[dt.datetime] = None
-    page_count = 0
+    page_count = resume_page_count
     for next_max_id, items in api.iter_user_comments_pages(
-        user_id=user_id, start_max_id=-1, max_pages=page_limit
+        user_id=user_id, start_max_id=int(start_max_id), max_pages=remaining_pages
     ):
         page_count += 1
         batch_oldest: Optional[dt.datetime] = None
@@ -883,9 +1328,31 @@ def _crawl_comments_via_api(
             f"日期 {_format_progress_dt(batch_newest)} -> {_format_progress_dt(batch_oldest)} next_max_id={next_max_id}",
             file=sys.stderr,
         )
+        progress_store.upsert(
+            since_bj_iso=since_bj_iso,
+            stage=stage_name,
+            status="running",
+            cursor_text=str(next_max_id),
+            current_index=page_count,
+            total_count=page_limit,
+            detail={
+                "last_oldest_bj": batch_oldest.isoformat() if batch_oldest else "",
+                "last_newest_bj": batch_newest.isoformat() if batch_newest else "",
+            },
+        )
         if batch_oldest is not None and batch_oldest < since_bj:
             break
 
+    progress_store.mark_completed(
+        since_bj_iso=since_bj_iso,
+        stage=stage_name,
+        cursor_text=str(
+            start_max_id if page_count == resume_page_count else next_max_id
+        ),
+        current_index=page_count,
+        total_count=page_limit,
+        detail={"oldest_seen_bj": oldest_seen.isoformat() if oldest_seen else ""},
+    )
     return wrote, oldest_seen, page_count
 
 
@@ -920,16 +1387,73 @@ def _backfill_talks_since(
     max_talk_pages: int,
     comments_store: Any,
     talks_store: Any,
+    talks_progress_store: Any,
 ) -> int:
     wrote = 0
+    skipped = 0
     since_bj_iso = since_bj.replace(microsecond=0).isoformat()
     refs = list(comments_store.iter_comment_refs_since(since_bj_iso=since_bj_iso))
+    total_refs = len(refs)
+
+    def _save_talks_progress(idx: int, ref_obj: dict[str, Any]) -> None:
+        progress_root_status_id = str(
+            ref_obj.get("root_in_reply_to_status_id")
+            or ref_obj.get("root_status_id")
+            or ""
+        )
+        talks_progress_store.upsert(
+            since_bj_iso=since_bj_iso,
+            comment_id=str(ref_obj.get("comment_id") or ""),
+            root_status_id=progress_root_status_id,
+            created_at_bj=str(ref_obj.get("created_at_bj") or ""),
+            current_index=int(idx),
+            total_count=total_refs,
+        )
+
     if refs:
-        print(f"[talks] 开始补齐，共 {len(refs)} 条评论链待检查。", file=sys.stderr)
+        print(f"[talks] 开始补齐，共 {total_refs} 条评论链待检查。", file=sys.stderr)
     else:
         print("[talks] 没有需要补齐的评论链。", file=sys.stderr)
+        talks_progress_store.clear(since_bj_iso=since_bj_iso)
+        return 0
 
-    for idx, ref in enumerate(refs, start=1):
+    checkpoint = talks_progress_store.get(since_bj_iso=since_bj_iso)
+    resume_index = 0
+    if checkpoint is not None:
+        checkpoint_comment_id = str(checkpoint.get("comment_id") or "")
+        checkpoint_root_status_id = str(checkpoint.get("root_status_id") or "")
+        for idx, ref in enumerate(refs, start=1):
+            ref_comment_id = str(ref.get("comment_id") or "")
+            ref_root_status_id = str(
+                ref.get("root_in_reply_to_status_id") or ref.get("root_status_id") or ""
+            )
+            if ref_comment_id != checkpoint_comment_id:
+                continue
+            if (
+                checkpoint_root_status_id
+                and ref_root_status_id != checkpoint_root_status_id
+            ):
+                continue
+            resume_index = idx
+            break
+        if 0 < resume_index < total_refs:
+            print(
+                f"[talks] 发现断点，从第 {resume_index + 1}/{total_refs} 条继续。上次停在 comment={checkpoint_comment_id} root={checkpoint_root_status_id or '-'}",
+                file=sys.stderr,
+            )
+        elif resume_index >= total_refs:
+            print(
+                "[talks] 发现断点，但当前这批已经跑完了，这次直接收尾。",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "[talks] 发现旧断点，但这次没对上评论链，改为从头开始。",
+                file=sys.stderr,
+            )
+            talks_progress_store.clear(since_bj_iso=since_bj_iso)
+
+    for idx, ref in enumerate(refs[resume_index:], start=resume_index + 1):
         cid = ref.get("comment_id")
         root_status_id = ref.get("root_in_reply_to_status_id") or ref.get(
             "root_status_id"
@@ -937,7 +1461,7 @@ def _backfill_talks_since(
         if not cid or not root_status_id:
             continue
         print(
-            f"[talks] {idx}/{len(refs)} comment={cid} root={root_status_id} created_at={ref.get('created_at_bj') or '-'}",
+            f"[talks] {idx}/{total_refs} comment={cid} root={root_status_id} created_at={ref.get('created_at_bj') or '-'}",
             file=sys.stderr,
         )
 
@@ -960,8 +1484,10 @@ def _backfill_talks_since(
                 and max_page > 0
                 and fetched_pages >= min(max_page, int(max_talk_pages))
             ):
+                _save_talks_progress(idx, ref)
                 continue
             if not truncated and max_page == 0 and fetched_pages >= int(max_talk_pages):
+                _save_talks_progress(idx, ref)
                 continue
 
         existing_obj = (
@@ -971,22 +1497,39 @@ def _backfill_talks_since(
             if meta
             else None
         )
-        obj = api.fetch_talks_incremental(
-            root_status_id=str(root_status_id),
-            comment_id=str(cid),
-            max_pages=int(max_talk_pages),
-            existing=existing_obj,
-        )
-        if isinstance(obj, dict):
-            talks_store.upsert_obj(
+        try:
+            obj = api.fetch_talks_incremental(
                 root_status_id=str(root_status_id),
                 comment_id=str(cid),
-                user_id=str(user_id),
-                obj=obj,
+                max_pages=int(max_talk_pages),
+                existing=existing_obj,
             )
-            wrote += 1
+            if isinstance(obj, dict):
+                talks_store.upsert_obj(
+                    root_status_id=str(root_status_id),
+                    comment_id=str(cid),
+                    user_id=str(user_id),
+                    obj=obj,
+                )
+                wrote += 1
+        except (ChallengeRequiredError, BlockedError):
+            raise
+        except Exception as e:
+            skipped += 1
+            print(
+                f"[talks-skip] comment={cid} root={root_status_id} 这一条抓失败了，先跳过后面继续：{e}",
+                file=sys.stderr,
+            )
+        _save_talks_progress(idx, ref)
 
-    print(f"[talks] 补齐结束，新增/更新 {wrote} 条。", file=sys.stderr)
+    talks_progress_store.clear(since_bj_iso=since_bj_iso)
+    if skipped:
+        print(
+            f"[talks] 补齐结束，新增/更新 {wrote} 条，跳过失败 {skipped} 条。",
+            file=sys.stderr,
+        )
+    else:
+        print(f"[talks] 补齐结束，新增/更新 {wrote} 条。", file=sys.stderr)
     return wrote
 
 
@@ -1017,23 +1560,46 @@ def _load_user_ids_from_file(path: Path) -> list[str]:
 
 
 def _resolve_target_user_ids(args: argparse.Namespace) -> list[str]:
-    if args.user_list_file is not None:
-        return _load_user_ids_from_file(Path(args.user_list_file))
-
-    user_id = str(args.user_id or "").strip()
-    if not user_id:
-        raise RuntimeError("必须提供 --user-id 或 --user-list-file")
-    return [user_id]
+    return _load_user_ids_from_file(Path(args.user_list_file))
 
 
-def _resolve_db_path(
-    *, args: argparse.Namespace, out_dir: Path, is_batch_mode: bool
-) -> Path:
+def _resolve_db_path(*, args: argparse.Namespace, out_dir: Path) -> Path:
     if args.db is not None:
         return Path(args.db)
-    if is_batch_mode:
-        return out_dir / DEFAULT_BATCH_DB_BASENAME
-    return out_dir / DEFAULT_DB_BASENAME.format(user_id=str(args.user_id))
+    return out_dir / DEFAULT_BATCH_DB_BASENAME
+
+
+def _build_browser_profiles_root(out_dir: Path) -> Path:
+    stamp = dt.datetime.now(tz=BEIJING_TIMEZONE).strftime(
+        BROWSER_PROFILE_TIMESTAMP_FORMAT
+    )
+    path = out_dir / BROWSER_PROFILE_RUNS_DIRNAME / stamp
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _build_user_browser_profile_dir(
+    *, profiles_root: Path, index: int, user_id: str
+) -> Path:
+    return profiles_root / f"{int(index):03d}_{str(user_id)}"
+
+
+def _copy_browser_profile_dir(src: Path, dst: Path) -> None:
+    source = Path(src)
+    target = Path(dst)
+    source.mkdir(parents=True, exist_ok=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        shutil.rmtree(target)
+    shutil.copytree(
+        source,
+        target,
+        ignore=shutil.ignore_patterns(*BROWSER_PROFILE_COPY_IGNORE_PATTERNS),
+    )
+
+
+def _cleanup_browser_profile_dir(path: Path) -> None:
+    shutil.rmtree(path)
 
 
 def _run_single_user(
@@ -1054,18 +1620,96 @@ def _run_single_user(
     timeline_store = SqliteMergedStatusesStore(db=db, user_id=str(user_id))
     comment_store = SqliteMergedCommentsStore(db=db, user_id=str(user_id))
     talks_store = SqliteMergedTalksStore(db=db, user_id=str(user_id))
+    talks_progress_store = SqliteTalksProgressStore(db=db, user_id=str(user_id))
+    crawl_progress_store = SqliteCrawlProgressStore(db=db, user_id=str(user_id))
 
     # Cross-run de-dup relies on SQLite unique key (merge_key). Keep in-run sets only.
     seen_status_ids: set[str] = set()
     seen_comment_ids: set[str] = set()
 
     ui_page = session.ui_page
-    data_page = ui_page if args.cdp else session.page
-    data_api = XueqiuApi(data_page, api_cfg, prefer_page_fetch=bool(args.cdp))
+    prefer_page_fetch = bool(session.prefer_page_fetch)
+    data_page = ui_page if prefer_page_fetch else session.page
+    data_api = XueqiuApi(data_page, api_cfg, prefer_page_fetch=prefer_page_fetch)
     # Keep api_page around for talks backfill and future extensions.
     detail_api = XueqiuApi(session.page, api_cfg)
     detail_status_line_cache: dict[tuple[str, str, str, str], Optional[str]] = {}
     user_log_prefix = f"[user {user_id}]"
+
+    def fetch_detail_with_headless_worker(
+        *, status_id: str, source_status_url: str, status_url: str, status_user_id: str
+    ) -> tuple[Optional[str], Optional[str]]:
+        command = [
+            sys.executable,
+            "-m",
+            "xueqiu_crawler.detail_retry_worker",
+            "--status-id",
+            str(status_id),
+            "--min-delay",
+            str(args.min_delay),
+            "--jitter",
+            str(args.jitter),
+            "--max-retries",
+            str(args.max_retries),
+            "--max-consecutive-blocks",
+            str(args.max_consecutive_blocks),
+        ]
+        if source_status_url:
+            command.extend(["--source-status-url", str(source_status_url)])
+        if status_url:
+            command.extend(["--status-url", str(status_url)])
+        if status_user_id:
+            command.extend(["--status-user-id", str(status_user_id)])
+
+        try:
+            env = os.environ.copy()
+            src_root = str(Path(__file__).resolve().parents[1])
+            existing_pythonpath = str(env.get("PYTHONPATH") or "").strip()
+            env["PYTHONPATH"] = (
+                src_root
+                if not existing_pythonpath
+                else f"{src_root}{os.pathsep}{existing_pythonpath}"
+            )
+            proc = subprocess.run(
+                command,
+                cwd=str(Path(__file__).resolve().parents[2]),
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            stdout_text = str(proc.stdout or "").strip()
+            stderr_text = str(proc.stderr or "").strip()
+            if stderr_text:
+                print(
+                    f"[detail] 无头补抓 stderr status_id={status_id}: {stderr_text}",
+                    file=sys.stderr,
+                )
+            if not stdout_text:
+                return None, "无头补抓没有返回结果"
+            try:
+                payload = json.loads(stdout_text)
+            except Exception:
+                return None, f"无头补抓结果解析失败：{stdout_text}"
+
+            line = payload.get("line")
+            failure_reason = payload.get("failure_reason")
+            stealth_mode = str(payload.get("stealth_mode") or "").strip()
+            if stealth_mode:
+                print(
+                    f"[detail] 无头补抓 stealth={stealth_mode} status_id={status_id}",
+                    file=sys.stderr,
+                )
+            if proc.returncode != 0 and not line and not failure_reason:
+                return None, "无头补抓子进程失败"
+            return (
+                str(line).strip() if line not in (None, "") else None,
+                str(failure_reason).strip()
+                if failure_reason not in (None, "")
+                else None,
+            )
+        except Exception as exc:
+            return None, f"无头补抓异常：{exc}"
 
     def resolve_status_line(
         status_id: str,
@@ -1085,16 +1729,19 @@ def _run_single_user(
         if cache_key in detail_status_line_cache:
             return detail_status_line_cache[cache_key]
         print(f"[detail] 尝试补抓原帖全文 status_id={sid}", file=sys.stderr)
-        line = detail_api.fetch_status_display_line(
-            sid,
-            source_status_url=source_status_url,
-            status_url=status_url,
-            status_user_id=status_user_id,
+        line, failure_reason = fetch_detail_with_headless_worker(
+            status_id=sid,
+            source_status_url=str(source_status_url or "").strip(),
+            status_url=str(status_url or "").strip(),
+            status_user_id=str(status_user_id or "").strip(),
         )
         if line:
             print(f"[detail] 原帖全文补抓成功 status_id={sid}", file=sys.stderr)
         else:
-            print(f"[detail] 原帖全文补抓失败 status_id={sid}", file=sys.stderr)
+            print(
+                f"[detail] 原帖全文补抓失败 status_id={sid}，原因：{failure_reason or '页面没拿到正文'}",
+                file=sys.stderr,
+            )
         detail_status_line_cache[cache_key] = line
         return line
 
@@ -1117,9 +1764,26 @@ def _run_single_user(
     except Exception as e:
         print(str(e), file=sys.stderr)
         return 2
+    since_bj_iso = since_bj.replace(microsecond=0).isoformat()
 
     # core 模式默认尽量把“查看对话”也补齐；如果你只要主干数据可用 --no-talks 关闭。
     want_talks = bool(args.with_talks) or (not bool(args.no_talks))
+
+    if crawl_progress_store.is_completed(
+        since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_FINALIZE
+    ):
+        print(f"{user_log_prefix} 上次已经完整跑完，这次直接跳过。", file=sys.stderr)
+        return 0
+    if _user_has_entry_rows(db=db, user_id=str(user_id)) and not _user_has_raw_rows(
+        db=db, user_id=str(user_id)
+    ):
+        crawl_progress_store.mark_completed(
+            since_bj_iso=since_bj_iso,
+            stage=PROGRESS_STAGE_FINALIZE,
+            detail={"inferred_from_entries": True},
+        )
+        print(f"{user_log_prefix} 已发现完整结果，这次直接跳过。", file=sys.stderr)
+        return 0
 
     had_blocked = False
     wrote_statuses = 0
@@ -1127,33 +1791,47 @@ def _run_single_user(
     wrote_talks = 0
     limiter = RateLimiter(float(args.min_delay), float(args.jitter))
 
-    timeline_result = _crawl_via_ui_intercept(
-        page=ui_page,
-        out_dir=out_dir,
-        user_id=str(user_id),
-        since_bj=since_bj,
-        url=_profile_url(str(user_id)),
-        url_contains="/v4/statuses/user_timeline.json",
-        max_batches=int(args.max_timeline_pages),
-        store=timeline_store,
-        seen_ids=seen_status_ids,
-        normalize_fn=_normalize_timeline_status,
-        extract_records_fn=_extract_timeline_records,
-        limiter=limiter,
-        kind_name="timeline",
-    )
-    wrote_statuses = int(timeline_result.wrote)
-    if wrote_statuses:
-        print(
-            f"{user_log_prefix} 时间线新增写入 {wrote_statuses} 条到 SQLite：{db_path}"
+    if crawl_progress_store.is_completed(
+        since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_TIMELINE
+    ):
+        print(f"{user_log_prefix} 时间线上次已经跑完，这次跳过。", file=sys.stderr)
+    else:
+        timeline_result = _crawl_via_ui_intercept(
+            page=ui_page,
+            out_dir=out_dir,
+            user_id=str(user_id),
+            since_bj=since_bj,
+            url=_profile_url(str(user_id)),
+            url_contains="/v4/statuses/user_timeline.json",
+            max_batches=int(args.max_timeline_pages),
+            store=timeline_store,
+            seen_ids=seen_status_ids,
+            normalize_fn=_normalize_timeline_status,
+            extract_records_fn=_extract_timeline_records,
+            limiter=limiter,
+            kind_name="timeline",
+            progress_store=crawl_progress_store,
+            since_bj_iso=since_bj_iso,
+            stage_name=PROGRESS_STAGE_TIMELINE,
         )
-    elif not timeline_result.saw_any and timeline_result.html_path:
-        print(
-            f"{user_log_prefix} 未拦截到时间线 JSON，已降级保存 HTML 快照：{timeline_result.html_path}",
-            file=sys.stderr,
-        )
+        wrote_statuses = int(timeline_result.wrote)
+        if wrote_statuses:
+            print(
+                f"{user_log_prefix} 时间线新增写入 {wrote_statuses} 条到 SQLite：{db_path}"
+            )
+        elif not timeline_result.saw_any and timeline_result.html_path:
+            print(
+                f"{user_log_prefix} 未拦截到时间线 JSON，已降级保存 HTML 快照：{timeline_result.html_path}",
+                file=sys.stderr,
+            )
 
-    if args.cdp:
+    if crawl_progress_store.is_completed(
+        since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_COMMENTS
+    ):
+        print(f"{user_log_prefix} 回复上次已经跑完，这次跳过。", file=sys.stderr)
+        comments_pages = 0
+    elif prefer_page_fetch:
+        comments_fetch_error: Optional[Exception] = None
         try:
             wrote_comments, _comments_oldest, comments_pages = _crawl_comments_via_api(
                 api=data_api,
@@ -1162,6 +1840,9 @@ def _run_single_user(
                 max_pages=int(args.max_comment_pages),
                 store=comment_store,
                 seen_ids=seen_comment_ids,
+                progress_store=crawl_progress_store,
+                since_bj_iso=since_bj_iso,
+                stage_name=PROGRESS_STAGE_COMMENTS,
             )
         except ChallengeRequiredError as e:
             try:
@@ -1179,7 +1860,7 @@ def _run_single_user(
                     user_id,
                     int(args.login_timeout_sec),
                     target_url,
-                    navigate_to_blocked_url=not bool(args.cdp),
+                    navigate_to_blocked_url=not prefer_page_fetch,
                 )
                 wrote_comments, _comments_oldest, comments_pages = (
                     _crawl_comments_via_api(
@@ -1189,6 +1870,9 @@ def _run_single_user(
                         max_pages=int(args.max_comment_pages),
                         store=comment_store,
                         seen_ids=seen_comment_ids,
+                        progress_store=crawl_progress_store,
+                        since_bj_iso=since_bj_iso,
+                        stage_name=PROGRESS_STAGE_COMMENTS,
                     )
                 )
             except Exception as e2:
@@ -1199,10 +1883,30 @@ def _run_single_user(
             had_blocked = True
             wrote_comments, _comments_oldest, comments_pages = 0, None, 0
             print(f"{user_log_prefix} 回复接口当前不可用：{e}", file=sys.stderr)
+        except Exception as e:
+            comments_fetch_error = e
+            wrote_comments, _comments_oldest, comments_pages = 0, None, 0
         if wrote_comments:
             print(
                 f"{user_log_prefix} 回复新增写入 {wrote_comments} 条到 SQLite：{db_path}"
             )
+        elif comments_fetch_error is not None:
+            html2 = _write_html_snapshot(
+                out_dir,
+                user_id=str(user_id),
+                kind="comments",
+                page=ui_page,
+            )
+            if html2:
+                print(
+                    f"{user_log_prefix} 回复接口重试后还是不对：{comments_fetch_error}；已保存 HTML 快照：{html2}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"{user_log_prefix} 回复接口重试后还是不对：{comments_fetch_error}",
+                    file=sys.stderr,
+                )
         elif comments_pages == 0:
             html2 = _write_html_snapshot(
                 out_dir,
@@ -1233,6 +1937,17 @@ def _run_single_user(
         )
         wrote_comments = int(comments_result.wrote)
         comments_pages = int(comments_result.captured_batches)
+        crawl_progress_store.mark_completed(
+            since_bj_iso=since_bj_iso,
+            stage=PROGRESS_STAGE_COMMENTS,
+            current_index=int(comments_result.captured_batches),
+            total_count=int(comments_result.captured_batches),
+            detail={
+                "last_oldest_bj": comments_result.last_batch_oldest.isoformat()
+                if comments_result.last_batch_oldest
+                else ""
+            },
+        )
         if wrote_comments:
             print(
                 f"{user_log_prefix} 回复新增写入 {wrote_comments} 条到 SQLite：{db_path}"
@@ -1243,7 +1958,11 @@ def _run_single_user(
                 file=sys.stderr,
             )
 
-    if want_talks:
+    if want_talks and crawl_progress_store.is_completed(
+        since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_TALKS
+    ):
+        print(f"{user_log_prefix} 查看对话上次已经跑完，这次跳过。", file=sys.stderr)
+    elif want_talks:
         talks_api = detail_api
         try:
             wrote_talks = _backfill_talks_since(
@@ -1253,6 +1972,11 @@ def _run_single_user(
                 max_talk_pages=int(args.max_talk_pages),
                 comments_store=comment_store,
                 talks_store=talks_store,
+                talks_progress_store=talks_progress_store,
+            )
+            crawl_progress_store.mark_completed(
+                since_bj_iso=since_bj_iso,
+                stage=PROGRESS_STAGE_TALKS,
             )
         except ChallengeRequiredError as e:
             try:
@@ -1270,6 +1994,11 @@ def _run_single_user(
                     max_talk_pages=int(args.max_talk_pages),
                     comments_store=comment_store,
                     talks_store=talks_store,
+                    talks_progress_store=talks_progress_store,
+                )
+                crawl_progress_store.mark_completed(
+                    since_bj_iso=since_bj_iso,
+                    stage=PROGRESS_STAGE_TALKS,
                 )
             except Exception as e2:
                 had_blocked = True
@@ -1284,16 +2013,32 @@ def _run_single_user(
             print(
                 f"{user_log_prefix} 查看对话新增/补齐写入 {wrote_talks} 份到 SQLite：{db_path}"
             )
-
-    final_entries = collapse_user_records_to_entries(
-        db=db,
-        user_id=str(user_id),
-        resolve_status_line=resolve_status_line,
-    )
-    if final_entries:
-        print(
-            f"{user_log_prefix} 最终展示记录写入 {final_entries} 条到 SQLite：{db_path}"
+    else:
+        crawl_progress_store.mark_completed(
+            since_bj_iso=since_bj_iso,
+            stage=PROGRESS_STAGE_TALKS,
+            detail={"skipped": True},
         )
+
+    if not crawl_progress_store.is_completed(
+        since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_FINALIZE
+    ):
+        final_entries = collapse_user_records_to_entries(
+            db=db,
+            user_id=str(user_id),
+            resolve_status_line=resolve_status_line,
+        )
+        crawl_progress_store.mark_completed(
+            since_bj_iso=since_bj_iso,
+            stage=PROGRESS_STAGE_FINALIZE,
+            current_index=1,
+            total_count=1,
+            detail={"final_entries": int(final_entries)},
+        )
+        if final_entries:
+            print(
+                f"{user_log_prefix} 最终展示记录写入 {final_entries} 条到 SQLite：{db_path}"
+            )
 
     if had_blocked and (wrote_statuses + wrote_comments + wrote_talks == 0):
         print(
@@ -1305,30 +2050,23 @@ def _run_single_user(
     return 0
 
 
+def _prepare_base_browser_profile(*, args: argparse.Namespace, browser_cfg) -> None:
+    from .browser import BrowserSession
+
+    with BrowserSession(browser_cfg) as session:
+        ui_page = session.ui_page
+        if args.skip_login_check:
+            ui_page.goto(BASE_URL, wait_until="domcontentloaded")
+            return
+        _ensure_logged_in_ui(ui_page, int(args.login_timeout_sec))
+        time.sleep(BASE_PROFILE_COPY_SETTLE_SEC)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
     out_dir: Path = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.cdp:
-        # Preflight check: provide a clearer error than ECONNREFUSED.
-        cdp_base = str(args.cdp).rstrip("/")
-        version_url = f"{cdp_base}/json/version"
-        try:
-            req = Request(version_url, headers={"accept": "application/json"})
-            with urlopen(req, timeout=2) as resp:  # nosec - local loopback only
-                if resp.status >= 400:
-                    raise URLError(f"HTTP {resp.status}")
-        except Exception:
-            print(
-                "无法连接到 CDP 端点。请确认：1) Chrome 已启动并监听该端口；2) 端口仅绑定 127.0.0.1；"
-                "3) macOS 上必须用非默认的 --user-data-dir 启动 Chrome（否则不会开启 DevTools 远程调试）。",
-                file=sys.stderr,
-            )
-            print(f"你配置的 CDP 地址：{args.cdp}", file=sys.stderr)
-            print(f"建议先在终端验证：curl -s {version_url}", file=sys.stderr)
-            return 2
 
     try:
         target_user_ids = _resolve_target_user_ids(args)
@@ -1336,54 +2074,143 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(str(e), file=sys.stderr)
         return 2
 
-    is_batch_mode = args.user_list_file is not None
-    db_path = _resolve_db_path(args=args, out_dir=out_dir, is_batch_mode=is_batch_mode)
+    db_path = _resolve_db_path(args=args, out_dir=out_dir)
     cooldown_sec = max(0.0, float(args.user_cooldown_sec))
+    base_user_data_dir = Path(args.user_data_dir)
+    browser_profiles_root = _build_browser_profiles_root(out_dir)
+    try:
+        resume_since_bj = _parse_since_to_beijing(args.since, tz_name=str(args.tz))
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    resume_since_bj_iso = resume_since_bj.replace(microsecond=0).isoformat()
 
     # Import Playwright-dependent modules only when we actually need to crawl.
     from .browser import BrowserConfig, BrowserSession
 
-    browser_cfg = BrowserConfig(
+    base_browser_cfg = BrowserConfig(
         headless=bool(args.headless),
-        user_data_dir=Path(args.user_data_dir),
-        chrome_channel=None if args.cdp else str(args.chrome_channel or "chrome"),
-        cdp_url=str(args.cdp) if args.cdp else None,
+        user_data_dir=base_user_data_dir,
+        chrome_channel=str(args.chrome_channel or "chrome"),
+        cdp_url=None,
         reduce_automation_fingerprint=bool(args.reduce_automation_fingerprint),
+        manage_cdp=True,
     )
 
-    if is_batch_mode:
-        print(
-            f"批量模式：共 {len(target_user_ids)} 个用户，统一写入 SQLite：{db_path}",
-            file=sys.stderr,
-        )
+    print(
+        f"本次共 {len(target_user_ids)} 个用户，统一写入 SQLite：{db_path}",
+        file=sys.stderr,
+    )
+    print(f"基础浏览器资料目录：{base_user_data_dir}", file=sys.stderr)
+    print(f"本次临时浏览器目录根路径：{browser_profiles_root}", file=sys.stderr)
+
+    try:
+        _prepare_base_browser_profile(args=args, browser_cfg=base_browser_cfg)
+    except Exception as e:
+        print(f"准备基础浏览器资料目录失败：{e}", file=sys.stderr)
+        return 2
 
     with SqliteDb(db_path) as db:
-        with BrowserSession(browser_cfg) as session:
-            total = len(target_user_ids)
-            for index, user_id in enumerate(target_user_ids, start=1):
-                print(f"开始抓取用户 {index}/{total}：{user_id}", file=sys.stderr)
-                result = _run_single_user(
-                    args=args,
-                    db=db,
-                    db_path=db_path,
-                    out_dir=out_dir,
-                    session=session,
-                    user_id=str(user_id),
+        total = len(target_user_ids)
+        for index, user_id in enumerate(target_user_ids, start=1):
+            crawl_progress_store = SqliteCrawlProgressStore(db=db, user_id=str(user_id))
+            if crawl_progress_store.is_completed(
+                since_bj_iso=resume_since_bj_iso, stage=PROGRESS_STAGE_FINALIZE
+            ):
+                print(
+                    f"开始抓取用户 {index}/{total}：{user_id}（上次已经跑完，这次跳过）",
+                    file=sys.stderr,
                 )
-                if result != 0:
-                    if total > 1:
-                        print(
-                            f"用户 {user_id} 抓取失败。为保护账号，批量任务已停止，后续用户不会继续。",
-                            file=sys.stderr,
-                        )
-                    return result
+                continue
+            if _user_has_entry_rows(
+                db=db, user_id=str(user_id)
+            ) and not _user_has_raw_rows(db=db, user_id=str(user_id)):
+                crawl_progress_store.mark_completed(
+                    since_bj_iso=resume_since_bj_iso,
+                    stage=PROGRESS_STAGE_FINALIZE,
+                    detail={"inferred_from_entries": True},
+                )
+                print(
+                    f"开始抓取用户 {index}/{total}：{user_id}（已发现完整结果，这次跳过）",
+                    file=sys.stderr,
+                )
+                continue
+            user_profile_dir = _build_user_browser_profile_dir(
+                profiles_root=browser_profiles_root,
+                index=index,
+                user_id=str(user_id),
+            )
+            try:
+                _copy_browser_profile_dir(base_user_data_dir, user_profile_dir)
+            except Exception as e:
+                print(
+                    f"用户 {user_id} 的浏览器资料目录复制失败：{e}",
+                    file=sys.stderr,
+                )
+                return 2
 
-                if index < total and cooldown_sec > 0:
+            browser_cfg = BrowserConfig(
+                headless=bool(args.headless),
+                user_data_dir=user_profile_dir,
+                chrome_channel=str(args.chrome_channel or "chrome"),
+                cdp_url=None,
+                reduce_automation_fingerprint=bool(args.reduce_automation_fingerprint),
+                manage_cdp=True,
+            )
+            print(f"开始抓取用户 {index}/{total}：{user_id}", file=sys.stderr)
+            print(
+                f"用户 {user_id} 使用浏览器资料目录：{user_profile_dir}",
+                file=sys.stderr,
+            )
+            try:
+                with BrowserSession(browser_cfg) as session:
+                    result = _run_single_user(
+                        args=args,
+                        db=db,
+                        db_path=db_path,
+                        out_dir=out_dir,
+                        session=session,
+                        user_id=str(user_id),
+                    )
+            except Exception as e:
+                print(f"用户 {user_id} 抓取时启动浏览器失败：{e}", file=sys.stderr)
+                print(
+                    f"用户 {user_id} 的浏览器资料目录已保留：{user_profile_dir}",
+                    file=sys.stderr,
+                )
+                if total > 1:
                     print(
-                        f"用户 {user_id} 已完成，等待 {cooldown_sec:.1f} 秒后继续下一个用户。",
+                        f"用户 {user_id} 抓取失败。为保护账号，批量任务已停止，后续用户不会继续。",
                         file=sys.stderr,
                     )
-                    time.sleep(cooldown_sec)
+                return 2
+
+            if result != 0:
+                print(
+                    f"用户 {user_id} 的浏览器资料目录已保留：{user_profile_dir}",
+                    file=sys.stderr,
+                )
+                if total > 1:
+                    print(
+                        f"用户 {user_id} 抓取失败。为保护账号，批量任务已停止，后续用户不会继续。",
+                        file=sys.stderr,
+                    )
+                return result
+
+            try:
+                _cleanup_browser_profile_dir(user_profile_dir)
+            except Exception as e:
+                print(
+                    f"用户 {user_id} 的临时浏览器目录删除失败，已保留：{user_profile_dir}，原因：{e}",
+                    file=sys.stderr,
+                )
+
+            if index < total and cooldown_sec > 0:
+                print(
+                    f"用户 {user_id} 已完成，等待 {cooldown_sec:.1f} 秒后继续下一个用户。",
+                    file=sys.stderr,
+                )
+                time.sleep(cooldown_sec)
 
     return 0
 

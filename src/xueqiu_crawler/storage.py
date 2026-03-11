@@ -24,6 +24,8 @@ MERGE_KEY_COMMENT_PREFIX = f"{KIND_COMMENT}:"
 MERGE_KEY_TALK_PREFIX = f"{KIND_TALK}:"
 MERGE_KEY_ENTRY_STATUS_PREFIX = f"{KIND_ENTRY}:status:"
 MERGE_KEY_ENTRY_CHAIN_PREFIX = f"{KIND_ENTRY}:chain:"
+CRAWL_PROGRESS_TABLE_NAME = "crawl_progress"
+TALKS_PROGRESS_TABLE_NAME = "talks_progress"
 
 DEFAULT_TALK_TEXT_MAX_CHARS = 4000
 TALK_TEXT_SEPARATOR = "\n\n---\n\n"
@@ -809,6 +811,37 @@ class SqliteDb:
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_merged_records_user_created ON merged_records(user_id, created_at_bj)"
         )
+        c.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TALKS_PROGRESS_TABLE_NAME} (
+              user_id TEXT NOT NULL,
+              since_bj_iso TEXT NOT NULL,
+              comment_id TEXT NOT NULL DEFAULT '',
+              root_status_id TEXT NOT NULL DEFAULT '',
+              created_at_bj TEXT NOT NULL DEFAULT '',
+              current_index INTEGER NOT NULL DEFAULT 0,
+              total_count INTEGER NOT NULL DEFAULT 0,
+              updated_at_bj TEXT NOT NULL,
+              PRIMARY KEY (user_id, since_bj_iso)
+            )
+            """
+        )
+        c.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {CRAWL_PROGRESS_TABLE_NAME} (
+              user_id TEXT NOT NULL,
+              since_bj_iso TEXT NOT NULL,
+              stage TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT '',
+              cursor_text TEXT NOT NULL DEFAULT '',
+              current_index INTEGER NOT NULL DEFAULT 0,
+              total_count INTEGER NOT NULL DEFAULT 0,
+              detail_json TEXT NOT NULL DEFAULT '{{}}',
+              updated_at_bj TEXT NOT NULL,
+              PRIMARY KEY (user_id, since_bj_iso, stage)
+            )
+            """
+        )
         c.commit()
 
 
@@ -1076,4 +1109,171 @@ class SqliteMergedTalksStore:
             )
         except Exception:
             pass
+        self.db.conn.commit()
+
+
+@dataclass(frozen=True)
+class SqliteTalksProgressStore:
+    db: SqliteDb
+    user_id: str
+
+    def get(self, *, since_bj_iso: str) -> Optional[dict[str, Any]]:
+        row = self.db.conn.execute(
+            f"""
+            SELECT comment_id, root_status_id, created_at_bj, current_index, total_count, updated_at_bj
+            FROM {TALKS_PROGRESS_TABLE_NAME}
+            WHERE user_id = ? AND since_bj_iso = ?
+            """,
+            (str(self.user_id), str(since_bj_iso)),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "comment_id": str(row["comment_id"] or ""),
+            "root_status_id": str(row["root_status_id"] or ""),
+            "created_at_bj": str(row["created_at_bj"] or ""),
+            "current_index": int(row["current_index"] or 0),
+            "total_count": int(row["total_count"] or 0),
+            "updated_at_bj": str(row["updated_at_bj"] or ""),
+        }
+
+    def upsert(
+        self,
+        *,
+        since_bj_iso: str,
+        comment_id: str,
+        root_status_id: str,
+        created_at_bj: str,
+        current_index: int,
+        total_count: int,
+    ) -> None:
+        self.db.conn.execute(
+            f"""
+            INSERT INTO {TALKS_PROGRESS_TABLE_NAME}(
+              user_id, since_bj_iso, comment_id, root_status_id, created_at_bj,
+              current_index, total_count, updated_at_bj
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, since_bj_iso) DO UPDATE SET
+              comment_id = excluded.comment_id,
+              root_status_id = excluded.root_status_id,
+              created_at_bj = excluded.created_at_bj,
+              current_index = excluded.current_index,
+              total_count = excluded.total_count,
+              updated_at_bj = excluded.updated_at_bj
+            """,
+            (
+                str(self.user_id),
+                str(since_bj_iso),
+                str(comment_id or ""),
+                str(root_status_id or ""),
+                str(created_at_bj or ""),
+                int(current_index),
+                int(total_count),
+                _beijing_iso_now(),
+            ),
+        )
+        self.db.conn.commit()
+
+    def clear(self, *, since_bj_iso: str) -> None:
+        self.db.conn.execute(
+            f"DELETE FROM {TALKS_PROGRESS_TABLE_NAME} WHERE user_id = ? AND since_bj_iso = ?",
+            (str(self.user_id), str(since_bj_iso)),
+        )
+        self.db.conn.commit()
+
+
+@dataclass(frozen=True)
+class SqliteCrawlProgressStore:
+    db: SqliteDb
+    user_id: str
+
+    def get(self, *, since_bj_iso: str, stage: str) -> Optional[dict[str, Any]]:
+        row = self.db.conn.execute(
+            f"""
+            SELECT status, cursor_text, current_index, total_count, detail_json, updated_at_bj
+            FROM {CRAWL_PROGRESS_TABLE_NAME}
+            WHERE user_id = ? AND since_bj_iso = ? AND stage = ?
+            """,
+            (str(self.user_id), str(since_bj_iso), str(stage)),
+        ).fetchone()
+        if not row:
+            return None
+        detail = _try_load_json_obj(row["detail_json"]) or {}
+        return {
+            "status": str(row["status"] or ""),
+            "cursor_text": str(row["cursor_text"] or ""),
+            "current_index": int(row["current_index"] or 0),
+            "total_count": int(row["total_count"] or 0),
+            "detail": detail,
+            "updated_at_bj": str(row["updated_at_bj"] or ""),
+        }
+
+    def upsert(
+        self,
+        *,
+        since_bj_iso: str,
+        stage: str,
+        status: str,
+        cursor_text: str = "",
+        current_index: int = 0,
+        total_count: int = 0,
+        detail: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self.db.conn.execute(
+            f"""
+            INSERT INTO {CRAWL_PROGRESS_TABLE_NAME}(
+              user_id, since_bj_iso, stage, status, cursor_text,
+              current_index, total_count, detail_json, updated_at_bj
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, since_bj_iso, stage) DO UPDATE SET
+              status = excluded.status,
+              cursor_text = excluded.cursor_text,
+              current_index = excluded.current_index,
+              total_count = excluded.total_count,
+              detail_json = excluded.detail_json,
+              updated_at_bj = excluded.updated_at_bj
+            """,
+            (
+                str(self.user_id),
+                str(since_bj_iso),
+                str(stage),
+                str(status or ""),
+                str(cursor_text or ""),
+                int(current_index),
+                int(total_count),
+                json.dumps(detail or {}, ensure_ascii=False),
+                _beijing_iso_now(),
+            ),
+        )
+        self.db.conn.commit()
+
+    def mark_completed(
+        self,
+        *,
+        since_bj_iso: str,
+        stage: str,
+        cursor_text: str = "",
+        current_index: int = 0,
+        total_count: int = 0,
+        detail: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self.upsert(
+            since_bj_iso=since_bj_iso,
+            stage=stage,
+            status="completed",
+            cursor_text=cursor_text,
+            current_index=current_index,
+            total_count=total_count,
+            detail=detail,
+        )
+
+    def is_completed(self, *, since_bj_iso: str, stage: str) -> bool:
+        row = self.get(since_bj_iso=since_bj_iso, stage=stage)
+        return bool(row and row.get("status") == "completed")
+
+    def clear(self, *, since_bj_iso: str, stage: str) -> None:
+        self.db.conn.execute(
+            f"DELETE FROM {CRAWL_PROGRESS_TABLE_NAME} WHERE user_id = ? AND since_bj_iso = ? AND stage = ?",
+            (str(self.user_id), str(since_bj_iso), str(stage)),
+        )
         self.db.conn.commit()

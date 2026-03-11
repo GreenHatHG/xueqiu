@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 from urllib.parse import urlencode
 
 from .constants import (
@@ -29,6 +30,11 @@ class ChallengeRequiredError(BlockedError):
         self.final_url = final_url
         self.status = int(status)
         self.text_head = str(text_head)
+
+
+DETAIL_PAGE_INITIAL_WAIT_MS = 1200
+DETAIL_WAF_SETTLE_TIMEOUT_SEC = 8.0
+DETAIL_WAF_SETTLE_POLL_SEC = 1.0
 
 
 def _looks_like_html(text: str) -> bool:
@@ -386,6 +392,50 @@ class XueqiuApi:
         line_str = str(line or "").strip()
         return line_str or None
 
+    def _read_detail_page_state(
+        self, status_id: str, *, fallback_url: str
+    ) -> tuple[Optional[str], str, str, str]:
+        line = self._extract_status_display_line_from_page(status_id)
+        try:
+            final_url = str(self._nav_page.url or fallback_url or "")
+        except Exception:
+            final_url = str(fallback_url or "")
+        try:
+            page_html = str(self._nav_page.content() or "")
+        except Exception:
+            page_html = ""
+        try:
+            page_title = str(self._nav_page.title() or "")
+        except Exception:
+            page_title = ""
+        return line, final_url, page_html, page_title
+
+    def _wait_for_detail_page_to_settle(
+        self, status_id: str, *, fallback_url: str
+    ) -> tuple[Optional[str], str, str, str]:
+        line, final_url, page_html, page_title = self._read_detail_page_state(
+            status_id, fallback_url=fallback_url
+        )
+        if line:
+            return line, final_url, page_html, page_title
+
+        deadline = time.monotonic() + DETAIL_WAF_SETTLE_TIMEOUT_SEC
+        while self._looks_like_challenge_url(final_url) or _looks_like_waf_challenge(
+            page_html
+        ):
+            if time.monotonic() >= deadline:
+                break
+            try:
+                self._nav_page.wait_for_timeout(int(DETAIL_WAF_SETTLE_POLL_SEC * 1000))
+            except Exception:
+                break
+            line, final_url, page_html, page_title = self._read_detail_page_state(
+                status_id, fallback_url=fallback_url
+            )
+            if line:
+                return line, final_url, page_html, page_title
+        return line, final_url, page_html, page_title
+
     def fetch_status_display_line(
         self,
         status_id: str,
@@ -393,7 +443,7 @@ class XueqiuApi:
         source_status_url: Optional[str] = None,
         status_url: Optional[str] = None,
         status_user_id: Optional[str] = None,
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], Optional[str]]:
         """
         Open a status detail page and extract a readable "author: text" line.
 
@@ -403,7 +453,7 @@ class XueqiuApi:
 
         sid = str(status_id or "").strip()
         if not sid or self._nav_page is None:
-            return None
+            return None, "状态ID为空，没法补抓"
 
         candidate_urls: list[str] = []
         for candidate in (
@@ -417,20 +467,104 @@ class XueqiuApi:
             if candidate and candidate not in candidate_urls:
                 candidate_urls.append(candidate)
 
+        last_reason = "页面没拿到正文"
         for url in candidate_urls:
-            self.goto(url)
-            try:
-                self._nav_page.wait_for_timeout(1200)
-            except Exception:
-                pass
-            line = self._extract_status_display_line_from_page(sid)
-            if line:
-                return line
+            backoff = DEFAULT_BACKOFF_INITIAL_SEC
+            for attempt in range(self._cfg.max_retries + 1):
+                self._limiter.sleep_before_next()
+                try:
+                    resp = self._nav_page.goto(
+                        url, wait_until="domcontentloaded", timeout=30000
+                    )
+                except Exception:
+                    resp = None
+                try:
+                    self._nav_page.wait_for_timeout(DETAIL_PAGE_INITIAL_WAIT_MS)
+                except Exception:
+                    pass
+
+                try:
+                    status = int(resp.status) if resp is not None else 0
+                except Exception:
+                    status = 0
+                line, final_url, page_html, page_title = (
+                    self._wait_for_detail_page_to_settle(
+                        sid,
+                        fallback_url=str((resp.url if resp is not None else "") or url),
+                    )
+                )
+                if line:
+                    return line, None
+
+                issue_code = "empty_page"
+                issue_reason = "页面打开了，但没抠到正文"
+                if (
+                    status == 404
+                    or "404_雪球" in page_title
+                    or "没有找到这条讨论" in page_html
+                ):
+                    issue_code = "not_found"
+                    issue_reason = "帖子页 404，可能原帖没了"
+                elif self._looks_like_challenge_url(
+                    final_url
+                ) or _looks_like_waf_challenge(page_html):
+                    issue_code = "waf_challenge"
+                    issue_reason = "遇到风控验证页"
+                elif status in (401, 403, 429):
+                    issue_code = "blocked"
+                    issue_reason = f"页面被拦了（status={status}）"
+                elif status > 0:
+                    issue_reason = f"页面打开了，但没抠到正文（status={status}）"
+
+                last_reason = issue_reason
+                if issue_code == "waf_challenge":
+                    return None, issue_reason
+                if issue_code != "not_found" and attempt < self._cfg.max_retries:
+                    print(
+                        f"[detail-retry] status_id={sid} 第 {attempt + 1}/{self._cfg.max_retries + 1} 次重试：{issue_reason}",
+                        file=sys.stderr,
+                    )
+                    time.sleep(min(backoff, DEFAULT_BACKOFF_MAX_SEC))
+                    backoff *= 2
+                    continue
+                break
+        return None, last_reason
+
+    @staticmethod
+    def _describe_collection_payload_issue(
+        obj: Any, *, list_key: str, allow_empty: bool
+    ) -> Optional[str]:
+        if not isinstance(obj, dict):
+            return "顶层不是对象"
+        rows = obj.get(list_key)
+        if not isinstance(rows, list):
+            return f"{list_key} 不是列表"
+        if (not allow_empty) and (not rows):
+            return f"{list_key} 是空列表"
         return None
 
-    def fetch_json(self, url: str, referrer: Optional[str] = None) -> Any:
+    @staticmethod
+    def _is_terminal_empty_user_comments_page(obj: Any) -> bool:
+        if not isinstance(obj, dict):
+            return False
+        items = obj.get("items")
+        if not isinstance(items, list) or items:
+            return False
+        next_max_id = str(obj.get("next_max_id") or "").strip()
+        next_id = str(obj.get("next_id") or "").strip()
+        return next_max_id == "-1" and next_id == "-1"
+
+    def _fetch_json_with_retry(
+        self,
+        url: str,
+        *,
+        referrer: Optional[str] = None,
+        retry_reason: Optional[Callable[[Any], Optional[str]]] = None,
+        request_label: Optional[str] = None,
+    ) -> Any:
         backoff = DEFAULT_BACKOFF_INITIAL_SEC
         last_exc: Optional[Exception] = None
+        label = str(request_label or url)
 
         for attempt in range(self._cfg.max_retries + 1):
             try:
@@ -474,6 +608,18 @@ class XueqiuApi:
                         ) from e
                     raise
 
+                issue = retry_reason(obj) if retry_reason is not None else None
+                if issue is not None:
+                    if attempt < self._cfg.max_retries:
+                        print(
+                            f"[api-retry] {label} 回包不对，第 {attempt + 1}/{self._cfg.max_retries + 1} 次重试：{issue}",
+                            file=sys.stderr,
+                        )
+                        time.sleep(min(backoff, DEFAULT_BACKOFF_MAX_SEC))
+                        backoff *= 2
+                        continue
+                    raise RuntimeError(f"{label} 重试后回包还是不对：{issue}")
+
                 self._consecutive_blocks = 0
                 return obj
             except ChallengeRequiredError:
@@ -486,6 +632,11 @@ class XueqiuApi:
                 last_exc = e
 
             if attempt < self._cfg.max_retries:
+                if last_exc is not None:
+                    print(
+                        f"[api-retry] {label} 请求失败，第 {attempt + 1}/{self._cfg.max_retries + 1} 次重试：{last_exc}",
+                        file=sys.stderr,
+                    )
                 time.sleep(min(backoff, DEFAULT_BACKOFF_MAX_SEC))
                 backoff *= 2
 
@@ -616,9 +767,31 @@ class XueqiuApi:
                 "/statuses/user/comments.json",
                 {"user_id": user_id, "size": USER_COMMENTS_PAGE_SIZE, "max_id": max_id},
             )
-            obj = self.fetch_json(url)
+            allow_terminal_empty = _page_idx == 1
+
+            def _retry_reason(payload: Any) -> Optional[str]:
+                return self._describe_collection_payload_issue(
+                    payload,
+                    list_key="items",
+                    allow_empty=(_page_idx > 1)
+                    or (
+                        allow_terminal_empty
+                        and self._is_terminal_empty_user_comments_page(payload)
+                    ),
+                )
+
+            obj = self._fetch_json_with_retry(
+                url,
+                retry_reason=_retry_reason,
+                request_label=f"comments-api user={user_id} max_id={max_id}",
+            )
             items = obj.get("items") or []
             if not items:
+                if _page_idx == 1 and self._is_terminal_empty_user_comments_page(obj):
+                    print(
+                        f"[comments-api] user={user_id} 第一批为空且 next_max_id=-1，按无可见回复处理",
+                        file=sys.stderr,
+                    )
                 break
             yield int(obj.get("next_max_id") or -1), list(items)
             next_max_id = obj.get("next_max_id")
@@ -645,7 +818,14 @@ class XueqiuApi:
                 "asc": "true",
             },
         )
-        first = self.fetch_json(first_url, referrer=ref)
+        first = self._fetch_json_with_retry(
+            first_url,
+            referrer=ref,
+            retry_reason=lambda payload: self._describe_collection_payload_issue(
+                payload, list_key="comments", allow_empty=False
+            ),
+            request_label=f"talks root={root_status_id} comment={comment_id} page=1",
+        )
         max_page = int(first.get("maxPage") or 1)
         max_page = min(max_page, max_pages)
 
@@ -661,7 +841,14 @@ class XueqiuApi:
                     "asc": "true",
                 },
             )
-            obj = self.fetch_json(url, referrer=ref)
+            obj = self._fetch_json_with_retry(
+                url,
+                referrer=ref,
+                retry_reason=lambda payload: self._describe_collection_payload_issue(
+                    payload, list_key="comments", allow_empty=True
+                ),
+                request_label=f"talks root={root_status_id} comment={comment_id} page={p}",
+            )
             pages.append(obj)
             comments = obj.get("comments") or []
             if not comments and p >= max_page:
@@ -728,7 +915,14 @@ class XueqiuApi:
                 "asc": "true",
             },
         )
-        first = self.fetch_json(first_url, referrer=ref)
+        first = self._fetch_json_with_retry(
+            first_url,
+            referrer=ref,
+            retry_reason=lambda payload: self._describe_collection_payload_issue(
+                payload, list_key="comments", allow_empty=False
+            ),
+            request_label=f"talks root={root_status_id} comment={comment_id} page=1",
+        )
         max_page_reported = int(first.get("maxPage") or 1)
         max_page_target = min(max_page_reported, int(max_pages))
 
@@ -752,7 +946,14 @@ class XueqiuApi:
                     "asc": "true",
                 },
             )
-            obj = self.fetch_json(url, referrer=ref)
+            obj = self._fetch_json_with_retry(
+                url,
+                referrer=ref,
+                retry_reason=lambda payload: self._describe_collection_payload_issue(
+                    payload, list_key="comments", allow_empty=True
+                ),
+                request_label=f"talks root={root_status_id} comment={comment_id} page={page_num}",
+            )
             pages_out.append(obj)
             try:
                 fetched_page_nums.add(int(obj.get("page")))
