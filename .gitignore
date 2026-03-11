@@ -11,3 +11,4 @@ storage_state.json
 .idea
 /src/xueqiu_crawler.egg-info/
 uv.lock
+/Plan.md

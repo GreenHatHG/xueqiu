@@ -26,6 +26,7 @@ MERGE_KEY_ENTRY_STATUS_PREFIX = f"{KIND_ENTRY}:status:"
 MERGE_KEY_ENTRY_CHAIN_PREFIX = f"{KIND_ENTRY}:chain:"
 CRAWL_PROGRESS_TABLE_NAME = "crawl_progress"
 TALKS_PROGRESS_TABLE_NAME = "talks_progress"
+USERNAME_COLUMN_NAME = "username"
 
 DEFAULT_TALK_TEXT_MAX_CHARS = 4000
 TALK_TEXT_SEPARATOR = "\n\n---\n\n"
@@ -214,6 +215,94 @@ def _author_label_from_raw_json(raw_json: Any, fallback_user_id: str) -> str:
         if uid is not None:
             return str(uid)
     return str(fallback_user_id or "").strip()
+
+
+def _username_from_record(record: dict[str, Any], fallback_user_id: str) -> str:
+    label = _author_label_from_raw_json(record.get("raw_json"), fallback_user_id)
+    if label and label != str(fallback_user_id or "").strip():
+        return label
+    for key in ("screen_name", "screenName", "name", "nickname", "user_name"):
+        value = record.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _username_from_talk_obj(obj: dict[str, Any], fallback_user_id: str) -> str:
+    pages = obj.get("pages")
+    if not isinstance(pages, list):
+        return ""
+    fallback_user_id_str = str(fallback_user_id or "").strip()
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        comments = page.get("comments")
+        if not isinstance(comments, list):
+            continue
+        for comment in comments:
+            if not isinstance(comment, dict):
+                continue
+            comment_user_id = comment.get("user_id") or comment.get("uid")
+            if fallback_user_id_str and str(comment_user_id or "").strip() not in (
+                "",
+                fallback_user_id_str,
+            ):
+                continue
+            user_obj = comment.get("user")
+            if isinstance(user_obj, dict):
+                label = _user_label_from_user_obj(user_obj)
+                if label and label != fallback_user_id_str:
+                    return label
+    return ""
+
+
+def _username_from_payload(payload: dict[str, Any], fallback_user_id: str) -> str:
+    record = payload.get("record")
+    if isinstance(record, dict):
+        label = _username_from_record(record, fallback_user_id)
+        if label:
+            return label
+
+    status_payload = payload.get("status")
+    if isinstance(status_payload, dict):
+        status_record = status_payload.get("record")
+        if isinstance(status_record, dict):
+            label = _username_from_record(status_record, fallback_user_id)
+            if label:
+                return label
+
+    comment_payload = payload.get("comment")
+    if isinstance(comment_payload, dict):
+        comment_record = comment_payload.get("record")
+        if isinstance(comment_record, dict):
+            label = _username_from_record(comment_record, fallback_user_id)
+            if label:
+                return label
+
+    talk_obj = payload.get("clean")
+    if isinstance(talk_obj, dict):
+        label = _username_from_talk_obj(talk_obj, fallback_user_id)
+        if label:
+            return label
+
+    raw_talk_obj = payload.get("raw")
+    if isinstance(raw_talk_obj, dict):
+        label = _username_from_talk_obj(raw_talk_obj, fallback_user_id)
+        if label:
+            return label
+
+    talk_payload = payload.get("talk")
+    if isinstance(talk_payload, dict):
+        for key in ("clean", "raw"):
+            talk_obj = talk_payload.get(key)
+            if isinstance(talk_obj, dict):
+                label = _username_from_talk_obj(talk_obj, fallback_user_id)
+                if label:
+                    return label
+    return ""
 
 
 def _status_display_text(record: dict[str, Any]) -> str:
@@ -628,6 +717,9 @@ def collapse_user_records_to_entries(
         chain_candidates.append(
             {
                 "merge_key": f"{MERGE_KEY_ENTRY_CHAIN_PREFIX}{topic_status_id or 'unknown'}:{comment_id}",
+                "username": _username_from_payload(
+                    source.get("payload") or {}, str(user_id)
+                ),
                 "created_at_bj": record.get("created_at_bj")
                 or source.get("created_at_bj"),
                 "fetched_at_bj": source.get("fetched_at_bj") or _beijing_iso_now(),
@@ -696,6 +788,9 @@ def collapse_user_records_to_entries(
         final_entries.append(
             {
                 "merge_key": f"{MERGE_KEY_ENTRY_STATUS_PREFIX}{status_id}",
+                "username": _username_from_payload(
+                    source.get("payload") or {}, str(user_id)
+                ),
                 "created_at_bj": record.get("created_at_bj")
                 or source.get("created_at_bj"),
                 "fetched_at_bj": source.get("fetched_at_bj") or _beijing_iso_now(),
@@ -730,13 +825,14 @@ def collapse_user_records_to_entries(
     db.conn.executemany(
         f"""
         INSERT INTO {MERGED_TABLE_NAME}(
-          merge_key, user_id, created_at_bj, fetched_at_bj, text, context_json, payload_json
-        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+          merge_key, user_id, username, created_at_bj, fetched_at_bj, text, context_json, payload_json
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
                 str(item.get("merge_key") or ""),
                 str(user_id),
+                str(item.get("username") or ""),
                 item.get("created_at_bj"),
                 item.get("fetched_at_bj") or _beijing_iso_now(),
                 str(item.get("text") or EMPTY_TEXT_PLACEHOLDER),
@@ -800,6 +896,7 @@ class SqliteDb:
             CREATE TABLE IF NOT EXISTS merged_records (
               merge_key TEXT PRIMARY KEY,
               user_id TEXT NOT NULL,
+              username TEXT NOT NULL DEFAULT '',
               created_at_bj TEXT,
               fetched_at_bj TEXT NOT NULL,
               text TEXT NOT NULL DEFAULT '',
@@ -811,6 +908,14 @@ class SqliteDb:
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_merged_records_user_created ON merged_records(user_id, created_at_bj)"
         )
+        merged_columns = {
+            str(row["name"])
+            for row in c.execute(f"PRAGMA table_info({MERGED_TABLE_NAME})")
+        }
+        if USERNAME_COLUMN_NAME not in merged_columns:
+            c.execute(
+                f"ALTER TABLE {MERGED_TABLE_NAME} ADD COLUMN {USERNAME_COLUMN_NAME} TEXT NOT NULL DEFAULT ''"
+            )
         c.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {TALKS_PROGRESS_TABLE_NAME} (
@@ -856,13 +961,14 @@ class SqliteMergedStatusesStore:
         self.db.conn.executemany(
             f"""
             INSERT OR IGNORE INTO {MERGED_TABLE_NAME}(
-              merge_key, user_id, created_at_bj, fetched_at_bj, text, context_json, payload_json
-            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+              merge_key, user_id, username, created_at_bj, fetched_at_bj, text, context_json, payload_json
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     f"{MERGE_KEY_STATUS_PREFIX}{str(r.get('status_id'))}",
                     str(r.get("user_id") or self.user_id),
+                    _username_from_record(r, str(r.get("user_id") or self.user_id)),
                     r.get("created_at_bj"),
                     r.get("fetched_at_bj") or _beijing_iso_now(),
                     _status_display_text(r),
@@ -888,13 +994,14 @@ class SqliteMergedCommentsStore:
         self.db.conn.executemany(
             f"""
             INSERT OR IGNORE INTO {MERGED_TABLE_NAME}(
-              merge_key, user_id, created_at_bj, fetched_at_bj, text, context_json, payload_json
-            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+              merge_key, user_id, username, created_at_bj, fetched_at_bj, text, context_json, payload_json
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
                     f"{MERGE_KEY_COMMENT_PREFIX}{str(r.get('comment_id'))}",
                     str(r.get("user_id") or self.user_id),
+                    _username_from_record(r, str(r.get("user_id") or self.user_id)),
                     r.get("created_at_bj"),
                     r.get("fetched_at_bj") or _beijing_iso_now(),
                     _comment_display_text(r),
@@ -1082,9 +1189,10 @@ class SqliteMergedTalksStore:
         self.db.conn.execute(
             f"""
             INSERT INTO {MERGED_TABLE_NAME}(
-              merge_key, user_id, created_at_bj, fetched_at_bj, text, context_json, payload_json
-            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+              merge_key, user_id, username, created_at_bj, fetched_at_bj, text, context_json, payload_json
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(merge_key) DO UPDATE SET
+              username = excluded.username,
               fetched_at_bj = excluded.fetched_at_bj,
               text = excluded.text,
               context_json = excluded.context_json,
@@ -1093,6 +1201,7 @@ class SqliteMergedTalksStore:
             (
                 str(merge_key),
                 str(user_id),
+                _username_from_talk_obj(clean_obj, str(user_id)),
                 None,
                 _beijing_iso_now(),
                 str(text or ""),
