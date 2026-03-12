@@ -7,6 +7,7 @@ name = "xueqiu-crawler"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
+  "litellm>=1.82.1",
   "playwright>=1.41",
   "playwright-stealth>=2.0.2",
 ]

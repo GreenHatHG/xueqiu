@@ -1,0 +1,1290 @@
+#!/usr/bin/env python3
+# ruff: noqa: E402
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import re
+import sqlite3
+import sys
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Optional
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from xueqiu_crawler.constants import DEFAULT_OUTPUT_DIR
+from xueqiu_crawler.text_sanitize import sanitize_xueqiu_text
+
+MERGED_TABLE_NAME = "merged_records"
+ENTRY_PREFIX = "entry:"
+DISPLAY_SEPARATOR = "\n\n---\n\n"
+HUMAN_COMMENT_LIMIT = 800
+HUMAN_REPORT_TITLE = "人工核查汇总"
+HUMAN_TOPIC_SEPARATOR = "\n\n" + "=" * 40 + "\n\n"
+AI_TALK_CONTEXT_LIMIT = 3
+BEIJING_TIMEZONE = dt.timezone(dt.timedelta(hours=8))
+AI_DUPLICATE_TEXT_MIN_CHARS = 20
+AI_DUPLICATE_TEXT_RATIO = 0.96
+
+PROMPT_HEADER = """你现在的角色是一个**面向理财小白的“大白话”投资翻译官**。
+你的任务是从一堆大佬的日常发言中，提取他们真正在买卖什么、提示什么风险、或者有什么投资感悟，并将其结构化，以便供系统构建“抄作业雷达”和“风险看板”。
+
+【绝对禁止金融黑话规则】
+小白听不懂专业术语。你的 `summary` 必须用最直白、最接地气的大白话写。
+- 禁止使用：上行动能、支撑位、阻力位、筹码分布、量价齐升、估值中枢、筑底等黑话。
+- 必须翻译：如果大佬原文说“该价位缺乏支撑”，你要翻译成“觉得这价格还会继续跌”；如果说“左侧建仓”，翻译成“趁现在大跌没人要，开始买入”。
+
+【股市语境与反讽识别（极度重要，防多空颠倒准则）】
+你必须具备“老股民”的常识，绝不能单纯按字面意思理解，必须时刻警惕以下 4 种典型语境：
+1. 供需逻辑的反转：交易中“随便买”、“管够”代表卖盘极大，这是绝对的【极度看弱 (view.bearish)】；反之“买不到”、“排队”才是强势看多。
+2. 阴阳怪气与反讽：配有 `[捂脸]`、`[狗头]` 等表情，或者在暴跌时说“A股永远的神”、“又给大家送钱了”。这99%是嘲讽，绝不能标记为 bullish，必须将其翻译成“无奈吐槽”。
+3. 被动套牢 vs 主动看好：“装死”、“躺平”、“关灯吃面”表示被套牢，动作归为 `trade.hold`，但 `summary` 必须翻译为“被套牢了，无奈只能拿着”。
+4. 事件驱动与套利底线：说“跌不到X元”只是陈述客观底线，并不代表看好买入。统统归为 `trade.watch`（先观察）。
+
+【信息过滤、上下文阅读与标签优先级准则】
+1. **精准阅读对话逻辑树**：输入数据被组织成了类似文件夹目录的【树状结构】（使用 ├── 和 └── 缩进）。缩进代表回复关系，子节点是对父节点的回复。你必须结合整条分支（从根节点顺藤摸瓜往下读）的上下文来理解最下方节点的意思。
+2. **强制带入背景**：如果他在回复父节点，你的 `summary` 必须交代背景，格式如：“针对上层网友担心的面板价格问题，他认为...”。绝不可剥离背景输出干瘪的结论。
+3. **废话零容忍**：没有明确指向特定个股、行业、具体宏观事件的“正确的废话”，直接抛弃，不要生成 item！
+4. **合并同类项**：如果同一个发言人在树的不同分支上表达了类似观点，请将其合并成 1 个 item 输出。
+
+【标签与分类体系】（完全对齐数据库）
+`topic_key`（主聚合键，一条只能有一个，优先具体个股 > 行业 > 宏观/方法）：
+- 个股：`stock:代码`（如 stock:600519.SH）/ 行业：`industry:名称` / 指数：`index:名称` / 宏观：`macro:名称` / 方法：`method:名称`
+
+`action`（核心动作分类）：
+- 交易：`trade.buy`, `trade.add`, `trade.reduce`, `trade.sell`, `trade.hold`, `trade.watch`
+- 观点：`view.bullish`, `view.bearish`, `valuation.cheap`, `valuation.expensive`
+- 风险：`risk.warning`, `risk.event`
+- 经验：`education.method`, `education.mindset`, `education.life`
+
+`action_strength`（语气强度 0-3）：0(顺带一提), 1(一般看法), 2(明确动作), 3(强烈情绪/反复强调)
+
+输出 JSON 格式（必须严格遵循）：
+{
+  "topic_status_id": "string",
+  "topic_summary": "string",
+  "items": [
+    {
+      "source_kind": "status|comment|topic_post|talk_reply (直接从节点方括号中提取)",
+      "source_id": "string (直接从节点方括号中提取 ID，例如 398840538)",
+      "speaker": "string (提取纯名字)",
+      "relation_to_topic": "new|follow|repeat|forward",
+      "topic_key": "stock:600519.SH",
+      "action": "trade.buy",
+      "action_strength": 2,
+      "summary": "string (极其直白的大白话概括，严禁金融黑话)",
+      "evidence": "string (提取能证明观点的原文)",
+      "confidence": 0.0,
+      "stock_codes": [],
+      "stock_names": [],
+      "industries": []
+    }
+  ]
+}
+注意：如果没有提到具体的股票或行业，`stock_codes`, `stock_names`, `industries` 输出空数组 `[]` 即可。
+
+下面会有很多个话题块。请仔细阅读【对话逻辑树】并输出 JSON 分析结果。"""
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="test_topic_prompt",
+        description="Build a topic package from merged_records and print an AI-ready prompt.",
+    )
+    parser.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help="SQLite path. If omitted and only one data/xueqiu_*.sqlite3 exists, that file is used.",
+    )
+    parser.add_argument(
+        "--list-topics",
+        action="store_true",
+        help="List available topic_status_id values instead of generating a prompt.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=5,
+        help="How many topics to include.",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Optional output file path for the generated prompt.",
+    )
+    parser.add_argument(
+        "--human-out",
+        type=Path,
+        default=None,
+        help="Optional output file path for the human-readable review text.",
+    )
+    parser.add_argument(
+        "--human-only",
+        action="store_true",
+        help="Print the human-readable review text instead of the AI prompt.",
+    )
+    return parser.parse_args()
+
+
+def _resolve_db_path(raw_path: Optional[Path]) -> Path:
+    if raw_path is not None:
+        return Path(raw_path)
+
+    candidates = sorted(
+        path
+        for path in (PROJECT_ROOT / DEFAULT_OUTPUT_DIR).glob("xueqiu_*.sqlite3")
+        if path.is_file()
+    )
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise SystemExit("没找到 sqlite 文件，请用 --db 指一下。")
+    raise SystemExit("找到多个 sqlite 文件，请用 --db 指一下。")
+
+
+def _load_json_obj(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    try:
+        obj = json.loads(str(value))
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(sanitize_xueqiu_text(str(value))).strip()
+
+
+def _normalize_created_at(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    try:
+        if raw.isdigit():
+            ts = int(raw)
+            if ts > 10**12:
+                ts /= 1000.0
+            parsed = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).astimezone(
+                BEIJING_TIMEZONE
+            )
+            return parsed.replace(microsecond=0).isoformat()
+
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=BEIJING_TIMEZONE)
+        else:
+            parsed = parsed.astimezone(BEIJING_TIMEZONE)
+        return parsed.replace(microsecond=0).isoformat()
+    except Exception:
+        return raw
+
+
+def _first_non_empty_text(*values: Any) -> str:
+    for value in values:
+        text = _clean_text(value)
+        if text:
+            return text
+    return ""
+
+
+def _user_label_from_user_obj(user_obj: Any) -> str:
+    if not isinstance(user_obj, dict):
+        return ""
+    for key in ("screen_name", "screenName", "name", "nickname"):
+        value = user_obj.get(key)
+        text = str(value).strip() if value is not None else ""
+        if text:
+            return text
+    for key in ("id", "user_id", "uid"):
+        value = user_obj.get(key)
+        text = str(value).strip() if value is not None else ""
+        if text:
+            return text
+    return ""
+
+
+def _speaker_from_raw_json(raw_json: Any, fallback_user_id: Any) -> str:
+    raw_obj = _load_json_obj(raw_json)
+    if raw_obj:
+        label = _user_label_from_user_obj(raw_obj.get("user"))
+        if label:
+            return label
+        label = _user_label_from_user_obj(raw_obj.get("reply_user"))
+        if label:
+            return label
+        for key in ("screen_name", "screenName", "name"):
+            value = raw_obj.get(key)
+            text = str(value).strip() if value is not None else ""
+            if text:
+                return text
+    fallback = str(fallback_user_id or "").strip()
+    return fallback
+
+
+def _split_display_lines(text: Any) -> list[str]:
+    if text is None:
+        return []
+    parts = [str(part).strip() for part in str(text).split(DISPLAY_SEPARATOR)]
+    return [part for part in parts if part]
+
+
+def _collapse_inline_whitespace(value: Any) -> str:
+    return " ".join(str(value or "").split())
+
+
+def _strip_reply_wrappers(text: Any) -> str:
+    clean_text = str(text or "").strip()
+    if not clean_text:
+        return ""
+    clean_text = re.sub(r"^(?:回复@[^:：]+[:：]\s*)+", "", clean_text)
+    clean_text = re.sub(r"\s*//@.*$", "", clean_text)
+    return clean_text.strip()
+
+
+def _ai_compare_text(value: Any) -> str:
+    text = _collapse_inline_whitespace(_clean_text(value))
+    if not text:
+        return ""
+    return _strip_reply_wrappers(text)
+
+
+def _ai_tree_text(value: Any) -> str:
+    text = _collapse_inline_whitespace(_clean_text(value))
+    if not text:
+        return ""
+    return _strip_reply_wrappers(text)
+
+
+def _looks_like_same_message(left: Any, right: Any) -> bool:
+    left_text = _ai_compare_text(left)
+    right_text = _ai_compare_text(right)
+    if not left_text or not right_text:
+        return False
+    if left_text == right_text:
+        return True
+
+    shorter, longer = sorted((left_text, right_text), key=len)
+    if len(shorter) >= AI_DUPLICATE_TEXT_MIN_CHARS and shorter in longer:
+        return True
+    if len(shorter) < AI_DUPLICATE_TEXT_MIN_CHARS:
+        return False
+    return SequenceMatcher(None, left_text, right_text).ratio() >= AI_DUPLICATE_TEXT_RATIO
+
+
+def _line_to_speaker_and_text(line: str) -> tuple[str, str]:
+    content = str(line or "").strip()
+    if not content:
+        return "", ""
+    if "：" not in content:
+        return "", content
+    speaker, body = content.split("：", 1)
+    return speaker.strip(), body.strip()
+
+
+def _build_root_status_hint(
+        *,
+        row_text: Any,
+        talk_context: list[dict[str, str]],
+        topic_status_id: str,
+        root_status_id: str,
+) -> Optional[dict[str, str]]:
+    if not root_status_id or root_status_id == topic_status_id:
+        return None
+
+    lines = _split_display_lines(row_text)
+    if not lines:
+        return None
+
+    chain_line_count = len(talk_context) + 1
+    if len(lines) <= chain_line_count:
+        return None
+
+    root_line = lines[: len(lines) - chain_line_count][-1]
+    speaker, text = _line_to_speaker_and_text(root_line)
+    if not text:
+        return None
+
+    return {
+        "source_kind": "status",
+        "source_id": root_status_id,
+        "speaker": speaker,
+        "created_at": "",
+        "text": text,
+        "display_text": root_line,
+    }
+
+
+def _build_reply_parent_hint(raw_json: Any) -> Optional[dict[str, str]]:
+    raw_obj = _load_json_obj(raw_json)
+    if not raw_obj:
+        return None
+
+    parent_obj = raw_obj.get("reply_comment")
+    if not isinstance(parent_obj, dict):
+        return None
+
+    source_id = str(parent_obj.get("id") or parent_obj.get("comment_id") or "").strip()
+    if not source_id:
+        return None
+
+    text = _first_non_empty_text(parent_obj.get("text"), parent_obj.get("description"))
+    if not text:
+        return None
+
+    speaker = _user_label_from_user_obj(parent_obj.get("user"))
+    if not speaker:
+        speaker = _user_label_from_user_obj(raw_obj.get("reply_user"))
+    if not speaker:
+        speaker = str(raw_obj.get("reply_screenName") or "").strip()
+
+    return {
+        "source_kind": "talk_reply",
+        "source_id": source_id,
+        "speaker": speaker,
+        "created_at": _normalize_created_at(
+            parent_obj.get("created_at_bj") or parent_obj.get("created_at")
+        ),
+        "text": text,
+        "in_reply_to_comment_id": str(parent_obj.get("in_reply_to_comment_id") or "").strip(),
+    }
+
+
+def _pick_row_created_at(row_created_at_bj: Any, record: dict[str, Any]) -> str:
+    return _normalize_created_at(record.get("created_at_bj") or row_created_at_bj)
+
+
+def _message_sort_key(item: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(item.get("created_at") or "").strip(),
+        str(item.get("source_id") or "").strip(),
+    )
+
+
+def _build_status_message(
+        *,
+        merge_key: str,
+        row_created_at_bj: Any,
+        row_text: Any,
+        context_obj: dict[str, Any],
+        payload_obj: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    status_payload = payload_obj.get("status")
+    if not isinstance(status_payload, dict):
+        return None
+    record = status_payload.get("record")
+    if not isinstance(record, dict):
+        return None
+
+    source_id = str(context_obj.get("status_id") or record.get("status_id") or "").strip()
+    if not source_id:
+        return None
+
+    text = _first_non_empty_text(
+        record.get("text"),
+        record.get("description"),
+        _load_json_obj(record.get("raw_json")).get("description"),
+        _load_json_obj(record.get("raw_json")).get("text"),
+    )
+    if not text:
+        return None
+
+    return {
+        "merge_key": merge_key,
+        "source_kind": "status",
+        "source_id": source_id,
+        "speaker": _speaker_from_raw_json(record.get("raw_json"), record.get("user_id")),
+        "created_at": _pick_row_created_at(row_created_at_bj, record),
+        "text": text,
+        "display_text": str(row_text or "").strip(),
+        "topic_status_id": str(context_obj.get("topic_status_id") or "").strip(),
+    }
+
+
+def _build_talk_context(
+        payload_obj: dict[str, Any], parent_source_id: str
+) -> list[dict[str, str]]:
+    talk_payload = payload_obj.get("talk")
+    if not isinstance(talk_payload, dict):
+        return []
+    clean_obj = talk_payload.get("clean")
+    if not isinstance(clean_obj, dict):
+        return []
+
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    pages = clean_obj.get("pages")
+    if not isinstance(pages, list):
+        return []
+
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        comments = page.get("comments")
+        if not isinstance(comments, list):
+            continue
+        for item in comments:
+            if not isinstance(item, dict):
+                continue
+            text = _first_non_empty_text(item.get("text"), item.get("description"))
+            if not text:
+                continue
+            speaker = _user_label_from_user_obj(item.get("user"))
+            if not speaker:
+                speaker = str(item.get("user_id") or item.get("uid") or "").strip()
+            key = (speaker, text)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "source_kind": "talk_reply",
+                    "source_id": str(item.get("id") or item.get("comment_id") or "").strip(),
+                    "speaker": speaker,
+                    "created_at": _normalize_created_at(
+                        item.get("created_at_bj") or item.get("created_at") or ""
+                    ),
+                    "text": text,
+                }
+            )
+            if out[-1]["source_id"] == parent_source_id:
+                out.pop()
+    out.sort(key=_message_sort_key, reverse=True)
+    return out
+
+
+def _build_comment_message(
+        *,
+        merge_key: str,
+        row_created_at_bj: Any,
+        row_text: Any,
+        context_obj: dict[str, Any],
+        payload_obj: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    comment_payload = payload_obj.get("comment")
+    if not isinstance(comment_payload, dict):
+        return None
+    record = comment_payload.get("record")
+    if not isinstance(record, dict):
+        return None
+
+    source_id = str(context_obj.get("comment_id") or record.get("comment_id") or "").strip()
+    if not source_id:
+        return None
+
+    text = _first_non_empty_text(
+        record.get("text"),
+        record.get("description"),
+        _load_json_obj(record.get("raw_json")).get("description"),
+        _load_json_obj(record.get("raw_json")).get("text"),
+    )
+    if not text:
+        return None
+
+    message = {
+        "merge_key": merge_key,
+        "source_kind": "comment",
+        "source_id": source_id,
+        "speaker": _speaker_from_raw_json(record.get("raw_json"), record.get("user_id")),
+        "created_at": _pick_row_created_at(row_created_at_bj, record),
+        "text": text,
+        "display_text": str(row_text or "").strip(),
+        "in_reply_to_comment_id": str(record.get("in_reply_to_comment_id") or "").strip(),
+        "root_status_id": str(
+            context_obj.get("root_status_id")
+            or record.get("root_status_id")
+            or record.get("root_in_reply_to_status_id")
+            or ""
+        ).strip(),
+        "root_status_url": str(
+            context_obj.get("root_status_url") or record.get("root_status_url") or ""
+        ).strip(),
+        "talk_context": _build_talk_context(payload_obj, source_id),
+    }
+
+    topic_status_id = str(context_obj.get("topic_status_id") or "").strip()
+    message["root_status_hint"] = _build_root_status_hint(
+        row_text=row_text,
+        talk_context=message["talk_context"],
+        topic_status_id=topic_status_id,
+        root_status_id=message["root_status_id"],
+    )
+    message["reply_parent_hint"] = _build_reply_parent_hint(record.get("raw_json"))
+
+    lines = _split_display_lines(row_text)
+    if lines:
+        topic_speaker, topic_text = _line_to_speaker_and_text(lines[0])
+        if topic_text:
+            message["topic_post_hint"] = {
+                "source_kind": "topic_post",
+                "source_id": topic_status_id,
+                "speaker": topic_speaker,
+                "created_at": "",
+                "text": topic_text,
+                "display_text": lines[0],
+            }
+    return message
+
+
+def _dedupe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for message in messages:
+        source_id = str(message.get("source_id") or "").strip()
+        if not source_id or source_id in seen:
+            continue
+        seen.add(source_id)
+        out.append(message)
+    out.sort(key=_message_sort_key, reverse=True)
+    return out
+
+
+def _choose_topic_post(
+        topic_status_id: str,
+        statuses: list[dict[str, Any]],
+        comments: list[dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
+    if statuses:
+        preferred: Optional[dict[str, Any]] = None
+        for item in statuses:
+            if str(item.get("source_id") or "") == topic_status_id:
+                preferred = item
+                break
+        if preferred is None:
+            preferred = statuses[0]
+        rest = [item for item in statuses if item is not preferred]
+        return preferred, rest
+
+    for comment in comments:
+        hint = comment.get("topic_post_hint")
+        if not isinstance(hint, dict):
+            continue
+        text = str(hint.get("text") or "").strip()
+        if text:
+            return hint, []
+    return None, []
+
+
+def _build_topics(db_path: Path) -> dict[str, dict[str, Any]]:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = list(
+            conn.execute(
+                f"""
+                SELECT merge_key, created_at_bj, text, context_json, payload_json
+                FROM {MERGED_TABLE_NAME}
+                WHERE merge_key LIKE ?
+                ORDER BY created_at_bj ASC, merge_key ASC
+                """,
+                (f"{ENTRY_PREFIX}%",),
+            )
+        )
+    finally:
+        conn.close()
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        merge_key = str(row["merge_key"] or "").strip()
+        context_obj = _load_json_obj(row["context_json"])
+        payload_obj = _load_json_obj(row["payload_json"])
+        topic_status_id = str(context_obj.get("topic_status_id") or "").strip()
+        if not topic_status_id:
+            continue
+
+        topic = grouped.setdefault(
+            topic_status_id,
+            {
+                "topic_status_id": topic_status_id,
+                "topic_post": None,
+                "status_updates": [],
+                "comments": [],
+            },
+        )
+
+        entry_type = str(context_obj.get("entry_type") or payload_obj.get("entry_type") or "").strip()
+        if entry_type == "status":
+            message = _build_status_message(
+                merge_key=merge_key,
+                row_created_at_bj=row["created_at_bj"],
+                row_text=row["text"],
+                context_obj=context_obj,
+                payload_obj=payload_obj,
+            )
+            if message is not None:
+                topic["status_updates"].append(message)
+        elif entry_type == "chain":
+            message = _build_comment_message(
+                merge_key=merge_key,
+                row_created_at_bj=row["created_at_bj"],
+                row_text=row["text"],
+                context_obj=context_obj,
+                payload_obj=payload_obj,
+            )
+            if message is not None:
+                topic["comments"].append(message)
+
+    for topic in grouped.values():
+        status_updates = _dedupe_messages(topic["status_updates"])
+        comments = _dedupe_messages(topic["comments"])
+        topic_post, rest_statuses = _choose_topic_post(
+            str(topic.get("topic_status_id") or ""),
+            status_updates,
+            comments,
+        )
+        for comment in comments:
+            comment.pop("topic_post_hint", None)
+        topic["topic_post"] = topic_post
+        topic["status_updates"] = rest_statuses
+        topic["comments"] = comments
+        latest_activity_candidates = [str(item.get("created_at") or "") for item in rest_statuses]
+        latest_activity_candidates.extend(
+            str(item.get("created_at") or "") for item in comments
+        )
+        if topic_post:
+            latest_activity_candidates.append(str(topic_post.get("created_at") or ""))
+        topic["stats"] = {
+            "status_count": len(rest_statuses) + (1 if topic_post else 0),
+            "comment_count": len(comments),
+            "talk_message_count": sum(
+                len(comment.get("talk_context") or []) for comment in comments
+            ),
+            "latest_activity_at": max(latest_activity_candidates) if latest_activity_candidates else "",
+        }
+    return grouped
+
+
+def _ranked_topics(topics: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    ranked = list(topics.values())
+    ranked.sort(
+        key=lambda item: (
+            str(item.get("stats", {}).get("latest_activity_at") or ""),
+            int(item.get("stats", {}).get("comment_count") or 0),
+            int(item.get("stats", {}).get("talk_message_count") or 0),
+            str(item.get("topic_status_id") or ""),
+        ),
+        reverse=True,
+    )
+    return ranked
+
+
+# ==========================================
+# 核心重构区：构建终极 Markdown Tree 树状图
+# ==========================================
+class TreeNode:
+    def __init__(self, n_id: str, speaker: str, text: str, kind: str, time: str):
+        self.id = n_id
+        self.speaker = speaker
+        self.text = text
+        self.kind = kind
+        self.time = time
+        self.children: dict[str, 'TreeNode'] = {}
+
+
+def _tree_node_from_item(item: dict[str, Any], *, default_kind: str, fallback_time: str) -> Optional[TreeNode]:
+    source_id = str(item.get("source_id") or "").strip()
+    if not source_id:
+        return None
+    return TreeNode(
+        source_id,
+        str(item.get("speaker") or ""),
+        str(item.get("text") or ""),
+        str(item.get("source_kind") or default_kind),
+        _normalize_created_at(item.get("created_at") or fallback_time or ""),
+    )
+
+
+def _comment_parent_path(
+        comment: dict[str, Any],
+        comments_by_id: dict[str, dict[str, Any]],
+        reply_parents_by_id: dict[str, dict[str, Any]],
+        *,
+        seen: Optional[set[str]] = None,
+) -> list[dict[str, Any]]:
+    if seen is None:
+        seen = set()
+
+    root_status_hint = comment.get("root_status_hint")
+    talks = comment.get("talk_context") or []
+    if talks:
+        path: list[dict[str, Any]] = []
+        if isinstance(root_status_hint, dict):
+            path.append(root_status_hint)
+        path.extend(reversed(talks))
+        return path
+
+    parent_comment_id = str(comment.get("in_reply_to_comment_id") or "").strip()
+    return _resolve_parent_chain(
+        parent_comment_id,
+        comments_by_id,
+        reply_parents_by_id,
+        root_status_hint if isinstance(root_status_hint, dict) else None,
+        seen,
+    )
+
+
+def _resolve_parent_chain(
+        parent_comment_id: str,
+        comments_by_id: dict[str, dict[str, Any]],
+        reply_parents_by_id: dict[str, dict[str, Any]],
+        root_status_hint: Optional[dict[str, Any]],
+        seen: set[str],
+) -> list[dict[str, Any]]:
+    if not parent_comment_id:
+        return [root_status_hint] if isinstance(root_status_hint, dict) else []
+    if parent_comment_id in seen:
+        return [root_status_hint] if isinstance(root_status_hint, dict) else []
+
+    seen.add(parent_comment_id)
+
+    parent_comment = comments_by_id.get(parent_comment_id)
+    if isinstance(parent_comment, dict):
+        chain = _comment_parent_path(
+            parent_comment,
+            comments_by_id,
+            reply_parents_by_id,
+            seen=seen,
+        )
+        return chain + [parent_comment]
+
+    parent_hint = reply_parents_by_id.get(parent_comment_id)
+    if not isinstance(parent_hint, dict):
+        return [root_status_hint] if isinstance(root_status_hint, dict) else []
+
+    next_parent_id = str(parent_hint.get("in_reply_to_comment_id") or "").strip()
+    chain = _resolve_parent_chain(
+        next_parent_id,
+        comments_by_id,
+        reply_parents_by_id,
+        root_status_hint,
+        seen,
+    )
+    return chain + [parent_hint]
+
+
+def _collect_ai_status_candidates(
+        topic_package: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], dict[str, int]]:
+    status_candidates: dict[str, dict[str, Any]] = {}
+    reply_counts: dict[str, int] = {}
+
+    for item in (topic_package.get("status_updates") or []):
+        source_id = str(item.get("source_id") or "").strip()
+        if not source_id:
+            continue
+        status_candidates[source_id] = item
+        reply_counts.setdefault(source_id, 0)
+
+    for comment in (topic_package.get("comments") or []):
+        hint = comment.get("root_status_hint")
+        if not isinstance(hint, dict):
+            continue
+        source_id = str(hint.get("source_id") or "").strip()
+        if not source_id:
+            continue
+        reply_counts[source_id] = reply_counts.get(source_id, 0) + 1
+        current = status_candidates.get(source_id)
+        if current is None:
+            status_candidates[source_id] = hint
+            continue
+        current_text = str(current.get("text") or "")
+        hint_text = str(hint.get("text") or "")
+        if len(hint_text) > len(current_text):
+            status_candidates[source_id] = hint
+
+    return status_candidates, reply_counts
+
+
+def _matching_status_id_for_comment(
+        comment: dict[str, Any],
+        status_candidates: dict[str, dict[str, Any]],
+        reply_counts: dict[str, int],
+) -> str:
+    speaker = str(comment.get("speaker") or "").strip()
+    text = str(comment.get("text") or "").strip()
+    source_id = str(comment.get("source_id") or "").strip()
+    if not speaker or not text or not source_id:
+        return ""
+
+    for status_id, status_item in status_candidates.items():
+        if status_id == source_id or reply_counts.get(status_id, 0) <= 0:
+            continue
+        if str(status_item.get("speaker") or "").strip() != speaker:
+            continue
+        if _looks_like_same_message(text, status_item.get("text")):
+            return status_id
+    return ""
+
+
+def _collect_status_anchor_paths(
+        comments: list[dict[str, Any]],
+        comments_by_id: dict[str, dict[str, Any]],
+        reply_parents_by_id: dict[str, dict[str, Any]],
+        hidden_status_ids_by_comment_id: dict[str, str],
+) -> dict[str, list[dict[str, Any]]]:
+    anchor_paths: dict[str, list[dict[str, Any]]] = {}
+
+    for comment in comments:
+        comment_id = str(comment.get("source_id") or "").strip()
+        status_id = hidden_status_ids_by_comment_id.get(comment_id, "")
+        if not status_id:
+            continue
+
+        path = _comment_parent_path(comment, comments_by_id, reply_parents_by_id)
+        current = anchor_paths.get(status_id)
+        if current is None or len(path) > len(current):
+            anchor_paths[status_id] = path
+
+    return anchor_paths
+
+
+def _expand_status_anchor_path(
+        path: list[dict[str, Any]],
+        status_anchor_paths: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    expanded = list(path)
+    seen_status_ids: set[str] = set()
+
+    while expanded:
+        first = expanded[0]
+        if str(first.get("source_kind") or "").strip() != "status":
+            break
+
+        status_id = str(first.get("source_id") or "").strip()
+        if not status_id or status_id in seen_status_ids:
+            break
+
+        anchor_path = status_anchor_paths.get(status_id) or []
+        if not anchor_path:
+            break
+
+        seen_status_ids.add(status_id)
+        expanded = list(anchor_path) + expanded
+
+    return expanded
+
+
+def _insert_tree_path(
+        tree_root: "TreeNode",
+        path_nodes: list["TreeNode"],
+) -> None:
+    curr = tree_root
+    for node in path_nodes:
+        if node.id not in curr.children:
+            curr.children[node.id] = node
+        curr = curr.children[node.id]
+
+
+def _build_ai_text_prompt(topic_package: dict[str, Any]) -> str:
+    """利用 talk_context 的路径关系，构建出完美的去重树状图 (类似 tree 命令)"""
+    topic_status_id = str(topic_package.get("topic_status_id") or "")
+    topic_post = topic_package.get("topic_post") or {}
+
+    # 1. 初始化根节点（主帖）
+    root_id = str(topic_post.get("source_id") or "root")
+    root_speaker = str(topic_post.get("speaker") or "主帖")
+    root_text = str(topic_post.get("text") or "原帖已被作者删除")
+
+    tree_root = TreeNode(root_id, root_speaker, root_text, "topic_post", str(topic_post.get("created_at") or ""))
+
+    comments = topic_package.get("comments") or []
+    status_candidates, reply_counts = _collect_ai_status_candidates(topic_package)
+    comments_by_id = {
+        str(item.get("source_id") or "").strip(): item
+        for item in comments
+        if str(item.get("source_id") or "").strip()
+    }
+    reply_parents_by_id = {
+        str(item.get("source_id") or "").strip(): item
+        for item in (
+            comment.get("reply_parent_hint")
+            for comment in comments
+            if isinstance(comment, dict)
+        )
+        if isinstance(item, dict) and str(item.get("source_id") or "").strip()
+    }
+    hidden_status_ids_by_comment_id = {
+        str(comment.get("source_id") or "").strip(): _matching_status_id_for_comment(
+            comment,
+            status_candidates,
+            reply_counts,
+        )
+        for comment in comments
+        if str(comment.get("source_id") or "").strip()
+    }
+    hidden_status_ids_by_comment_id = {
+        comment_id: status_id
+        for comment_id, status_id in hidden_status_ids_by_comment_id.items()
+        if status_id
+    }
+    status_anchor_paths = _collect_status_anchor_paths(
+        comments,
+        comments_by_id,
+        reply_parents_by_id,
+        hidden_status_ids_by_comment_id,
+    )
+    anchored_status_ids = {
+        status_id
+        for status_id, anchor_path in status_anchor_paths.items()
+        if anchor_path
+    }
+
+    # 2. 挂载独立发言 (Status) 到根节点
+    for st in (topic_package.get("status_updates") or []):
+        status_id = str(st.get("source_id") or "").strip()
+        if not status_id or status_id in anchored_status_ids:
+            continue
+        n = TreeNode(
+            status_id,
+            str(st.get("speaker") or ""),
+            str(st.get("text") or ""),
+            "status",
+            str(st.get("created_at") or "")
+        )
+        tree_root.children[n.id] = n
+
+    # 长文本虽然被折起来了，但它带的上层链路还得拿来给对应 status 重新找位置。
+    for status_id in sorted(anchored_status_ids):
+        anchor_path = _expand_status_anchor_path(
+            status_anchor_paths.get(status_id) or [],
+            status_anchor_paths,
+        )
+        status_item = status_candidates.get(status_id)
+        if not anchor_path or not isinstance(status_item, dict):
+            continue
+
+        path_nodes = []
+        for item in anchor_path:
+            node = _tree_node_from_item(
+                item,
+                default_kind="talk_reply",
+                fallback_time="",
+            )
+            if node is not None:
+                path_nodes.append(node)
+
+        status_node = _tree_node_from_item(
+            status_item,
+            default_kind="status",
+            fallback_time="",
+        )
+        if status_node is None:
+            continue
+        path_nodes.append(status_node)
+        _insert_tree_path(tree_root, path_nodes)
+
+    visible_comments = [
+        comment
+        for comment in comments
+        if str(comment.get("source_id") or "").strip()
+        not in hidden_status_ids_by_comment_id
+    ]
+
+    # 3. 挂载评论及对话链 (Talk Context -> Comment)
+    for cmt in visible_comments:
+        parent_path = _comment_parent_path(cmt, comments_by_id, reply_parents_by_id)
+        parent_path = _expand_status_anchor_path(parent_path, status_anchor_paths)
+
+        path_nodes = []
+        for item in parent_path:
+            node = _tree_node_from_item(
+                item,
+                default_kind="talk_reply",
+                fallback_time=str(cmt.get("created_at") or ""),
+            )
+            if node is not None:
+                path_nodes.append(node)
+
+        # 将评论自身作为链条的最底端叶子节点
+        comment_node = _tree_node_from_item(
+            cmt,
+            default_kind="comment",
+            fallback_time=str(cmt.get("created_at") or ""),
+        )
+        if comment_node is not None:
+            path_nodes.append(comment_node)
+
+        # 将这条路径（Path）插入到树中，自动实现“公共前缀合并去重”
+        _insert_tree_path(tree_root, path_nodes)
+
+    # 4. 渲染树状图文本
+    out_lines = [
+        f"【话题全局 ID: {topic_status_id}】",
+        "【对话逻辑树】（缩进代表回复关系，请按分支脉络阅读）：",
+        "=" * 40
+    ]
+
+    def render_node(node: TreeNode, prefix: str, is_last: bool, is_root: bool):
+        connector = ""
+        if not is_root:
+            connector = "└── " if is_last else "├── "
+
+        id_str = f"[{node.kind} ID: {node.id}] " if node.id != "root" else "[主帖] "
+
+        # 将多行文本压缩为单行，防止打乱树状图的视觉结构
+        clean_text = _ai_tree_text(node.text)
+
+        out_lines.append(f"{prefix}{connector}{id_str}{node.speaker}：{clean_text}")
+
+        # 为子节点准备前缀缩进符号
+        child_prefix = prefix
+        if not is_root:
+            child_prefix += "    " if is_last else "│   "
+
+        children_list = list(node.children.values())
+        # 同一层级的子节点按时间顺序排列，还原事件发生的先后
+        children_list.sort(key=lambda x: x.time)
+
+        for i, child in enumerate(children_list):
+            render_node(child, child_prefix, i == len(children_list) - 1, False)
+
+    # 从根节点开始递归打印
+    render_node(tree_root, "", True, True)
+
+    return "\n".join(out_lines)
+
+
+# ==========================================
+
+
+def _human_meta_text(*parts: Any) -> str:
+    values = [str(part or "").strip() for part in parts]
+    return " | ".join(value for value in values if value)
+
+
+def _human_message_lines(
+        title: str,
+        *,
+        speaker: Any,
+        created_at: Any,
+        source_id: Any,
+        display_text: Any,
+        body: Any,
+) -> list[str]:
+    speaker_text = str(speaker or "").strip() or "未知用户"
+    meta = _human_meta_text(speaker_text, created_at, source_id)
+
+    # 彻底与数据库原样展示保持一致
+    final_text = str(display_text or "").strip()
+    if not final_text:
+        final_text = str(body or "没内容").strip()
+
+    return [
+        f"【{title}】 {meta}",
+        final_text
+    ]
+
+
+def _human_collection_block(
+        title: str,
+        item_blocks: list[str],
+        *,
+        hidden_count: int,
+        hidden_label: str,
+) -> str:
+    parts = [f"--- {title} ---"]
+    if item_blocks:
+        parts.extend(item_blocks)
+        if hidden_count > 0:
+            parts.append(f"\n（还有 {hidden_count} 条{hidden_label}没展开）")
+    else:
+        parts.append("没有")
+    return "\n\n".join(parts)
+
+
+def _human_topic_post_block(topic_post: Optional[dict[str, Any]]) -> str:
+    if not isinstance(topic_post, dict):
+        return "主帖\n  没拿到"
+    return "\n".join(
+        _human_message_lines(
+            "主帖",
+            speaker=topic_post.get("speaker"),
+            created_at=topic_post.get("created_at"),
+            source_id=topic_post.get("source_id"),
+            display_text=topic_post.get("display_text"),
+            body=topic_post.get("text"),
+        )
+    )
+
+
+def _human_comment_block(comment: dict[str, Any], index: int) -> str:
+    return "\n".join(
+        _human_message_lines(
+            f"第 {index} 条",
+            speaker=comment.get("speaker"),
+            created_at=comment.get("created_at"),
+            source_id=comment.get("source_id"),
+            display_text=comment.get("display_text"),
+            body=comment.get("text"),
+        )
+    )
+
+
+def _human_status_update_block(item: dict[str, Any], index: int) -> str:
+    return "\n".join(
+        _human_message_lines(
+            f"第 {index} 条",
+            speaker=item.get("speaker"),
+            created_at=item.get("created_at"),
+            source_id=item.get("source_id"),
+            display_text=item.get("display_text"),
+            body=item.get("text"),
+        )
+    )
+
+
+def _build_human_topic_block(topic: dict[str, Any], index: int) -> str:
+    topic_status_id = str(topic.get("topic_status_id") or "").strip()
+    stats = topic.get("stats") or {}
+    latest_activity_at = str(stats.get("latest_activity_at") or "").strip()
+    comment_count = int(stats.get("comment_count") or 0)
+    talk_message_count = int(stats.get("talk_message_count") or 0)
+    status_updates = topic.get("status_updates") or []
+    comments = topic.get("comments") or []
+    if not isinstance(status_updates, list):
+        status_updates = []
+    if not isinstance(comments, list):
+        comments = []
+
+    summary_lines = [
+        f"[{index}] 话题 {topic_status_id}",
+        f"最近活跃：{latest_activity_at or '未知'}",
+        f"数量：独立发言 {len(status_updates)} 条 | 评论 {comment_count} 条 | 对话 {talk_message_count} 条",
+    ]
+    sections = ["\n".join(summary_lines), _human_topic_post_block(topic.get("topic_post"))]
+
+    status_blocks = []
+    if isinstance(status_updates, list):
+        for status_index, item in enumerate(status_updates[:HUMAN_COMMENT_LIMIT], start=1):
+            status_blocks.append(_human_status_update_block(item, status_index))
+    sections.append(
+        _human_collection_block(
+            "独立发言",
+            status_blocks,
+            hidden_count=max(0, len(status_updates) - HUMAN_COMMENT_LIMIT),
+            hidden_label="独立发言",
+        )
+    )
+
+    comment_blocks = []
+    if isinstance(comments, list):
+        for comment_index, item in enumerate(comments[:HUMAN_COMMENT_LIMIT], start=1):
+            comment_blocks.append(_human_comment_block(item, comment_index))
+    sections.append(
+        _human_collection_block(
+            "评论",
+            comment_blocks,
+            hidden_count=max(0, len(comments) - HUMAN_COMMENT_LIMIT),
+            hidden_label="评论",
+        )
+    )
+
+    return "\n\n".join(sections)
+
+
+def _build_human_report(topic_packages: list[dict[str, Any]]) -> str:
+    topic_blocks = [
+        _build_human_topic_block(topic, index)
+        for index, topic in enumerate(topic_packages, start=1)
+    ]
+    if not topic_blocks:
+        return HUMAN_REPORT_TITLE
+    return f"{HUMAN_REPORT_TITLE}\n\n{HUMAN_TOPIC_SEPARATOR.join(topic_blocks)}"
+
+
+def _build_combined_output(topic_packages: list[dict[str, Any]]) -> str:
+    sections: list[str] = [PROMPT_HEADER]
+    for index, topic in enumerate(topic_packages, start=1):
+        # 使用全新的 Tree 模式生成发给 AI 的内容
+        ai_script_text = _build_ai_text_prompt(topic)
+        human_block = _build_human_topic_block(topic, index)
+
+        sections.append(
+            "\n".join(
+                [
+                    f"话题块 {index}",
+                    "喂给 AI 的对话逻辑树：",
+                    "```text",
+                    ai_script_text,
+                    "```",
+                    "人工核查（纯数据库 text 拼接形态）：",
+                    human_block,
+                ]
+            )
+        )
+    return f"\n\n----\n\n".join(sections) + "\n"
+
+
+def _list_topics(topics: dict[str, dict[str, Any]], limit: int) -> str:
+    rows: list[dict[str, Any]] = []
+    for topic in _ranked_topics(topics):
+        topic_status_id = str(topic.get("topic_status_id") or "")
+        topic_post = topic.get("topic_post") or {}
+        text = str(topic_post.get("text") or "").strip()
+        rows.append(
+            {
+                "topic_status_id": topic_status_id,
+                "status_count": int(topic.get("stats", {}).get("status_count") or 0),
+                "comment_count": int(topic.get("stats", {}).get("comment_count") or 0),
+                "talk_message_count": int(
+                    topic.get("stats", {}).get("talk_message_count") or 0
+                ),
+                "latest_activity_at": str(
+                    topic.get("stats", {}).get("latest_activity_at") or ""
+                ),
+                "topic_post_speaker": str(topic_post.get("speaker") or ""),
+                "topic_post_text_head": text[:80],
+            }
+        )
+
+    return json.dumps(rows[: max(0, int(limit))], ensure_ascii=False, indent=2)
+
+
+def main() -> int:
+    args = _parse_args()
+    db_path = _resolve_db_path(args.db)
+    if not db_path.exists():
+        raise SystemExit(f"sqlite 文件不存在: {db_path}")
+
+    topics = _build_topics(db_path)
+    if args.list_topics:
+        print(_list_topics(topics, int(args.limit)))
+        return 0
+
+    selected_topics = _ranked_topics(topics)[: max(1, int(args.limit))]
+    if not selected_topics:
+        raise SystemExit("库里没有可用话题。")
+
+    human_report = _build_human_report(selected_topics)
+    combined_output = _build_combined_output(selected_topics)
+    if args.out is not None:
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(combined_output, encoding="utf-8")
+
+    if args.human_out is not None:
+        human_out_path = Path(args.human_out)
+        human_out_path.parent.mkdir(parents=True, exist_ok=True)
+        human_out_path.write_text(human_report, encoding="utf-8")
+
+    if args.human_only:
+        print(human_report)
+    else:
+        print(combined_output, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
