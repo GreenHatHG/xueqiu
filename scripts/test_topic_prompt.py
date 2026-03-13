@@ -30,6 +30,7 @@ ASSERTIONS_TABLE_NAME = "assertions"
 POSTS_TABLE_NAME = "posts"
 TOPIC_RUN_PROGRESS_TABLE_NAME = "topic_package_run_progress"
 USERNAME_COLUMN_NAME = "username"
+ROOT_STATUS_URL_FIELD_NAME = "root_status_url"
 JSON_ARRAY_EMPTY = "[]"
 ASSERTION_UID_PREFIX = "xueqiu:assertion"
 ASSERTION_UID_COLUMN_NAME = "assertion_uid"
@@ -642,6 +643,7 @@ def _build_root_status_hint(
     talk_context: list[dict[str, str]],
     topic_status_id: str,
     root_status_id: str,
+    fallback_created_at: str,
 ) -> Optional[dict[str, str]]:
     if not root_status_id or root_status_id == topic_status_id:
         return None
@@ -663,13 +665,18 @@ def _build_root_status_hint(
         "source_kind": "status",
         "source_id": root_status_id,
         "speaker": speaker,
-        "created_at": "",
+        "created_at": _normalize_created_at(fallback_created_at),
         "text": text,
         "display_text": root_line,
     }
 
 
-def _build_reply_parent_hint(raw_json: Any) -> Optional[dict[str, str]]:
+def _build_reply_parent_hint(
+    raw_json: Any,
+    *,
+    root_status_url: str,
+    fallback_created_at: str,
+) -> Optional[dict[str, str]]:
     raw_obj = _load_json_obj(raw_json)
     if not raw_obj:
         return None
@@ -692,18 +699,24 @@ def _build_reply_parent_hint(raw_json: Any) -> Optional[dict[str, str]]:
     if not speaker:
         speaker = str(raw_obj.get("reply_screenName") or "").strip()
 
-    return {
+    out = {
         "source_kind": "talk_reply",
         "source_id": source_id,
         "speaker": speaker,
         "created_at": _normalize_created_at(
-            parent_obj.get("created_at_bj") or parent_obj.get("created_at")
+            parent_obj.get("created_at_bj")
+            or parent_obj.get("created_at")
+            or fallback_created_at
         ),
         "text": text,
         "in_reply_to_comment_id": str(
             parent_obj.get("in_reply_to_comment_id") or ""
         ).strip(),
     }
+    root_status_url_text = str(root_status_url or "").strip()
+    if root_status_url_text:
+        out[ROOT_STATUS_URL_FIELD_NAME] = root_status_url_text
+    return out
 
 
 def _pick_row_created_at(row_created_at_bj: Any, record: dict[str, Any]) -> str:
@@ -770,7 +783,11 @@ def _build_status_message(
 
 
 def _build_talk_context(
-    payload_obj: dict[str, Any], parent_source_id: str
+    payload_obj: dict[str, Any],
+    parent_source_id: str,
+    *,
+    root_status_url: str,
+    fallback_created_at: str,
 ) -> list[dict[str, str]]:
     talk_payload = payload_obj.get("talk")
     if not isinstance(talk_payload, dict):
@@ -804,19 +821,24 @@ def _build_talk_context(
             if key in seen:
                 continue
             seen.add(key)
-            out.append(
-                {
-                    "source_kind": "talk_reply",
-                    "source_id": str(
-                        item.get("id") or item.get("comment_id") or ""
-                    ).strip(),
-                    "speaker": speaker,
-                    "created_at": _normalize_created_at(
-                        item.get("created_at_bj") or item.get("created_at")
-                    ),
-                    "text": text,
-                }
+            created_at = _normalize_created_at(
+                item.get("created_at_bj")
+                or item.get("created_at")
+                or fallback_created_at
             )
+            row = {
+                "source_kind": "talk_reply",
+                "source_id": str(
+                    item.get("id") or item.get("comment_id") or ""
+                ).strip(),
+                "speaker": speaker,
+                "created_at": created_at,
+                "text": text,
+            }
+            root_status_url_text = str(root_status_url or "").strip()
+            if root_status_url_text:
+                row[ROOT_STATUS_URL_FIELD_NAME] = root_status_url_text
+            out.append(row)
             if out[-1]["source_id"] == parent_source_id:
                 out.pop()
     out.sort(key=_message_sort_key, reverse=True)
@@ -844,6 +866,11 @@ def _build_comment_message(
     if not source_id:
         return None
 
+    created_at = _pick_row_created_at(row_created_at_bj, record)
+    root_status_url = str(
+        context_obj.get("root_status_url") or record.get("root_status_url") or ""
+    ).strip()
+
     text = _first_non_empty_text(
         record.get("text"),
         record.get("description"),
@@ -868,7 +895,7 @@ def _build_comment_message(
         "source_kind": "comment",
         "source_id": source_id,
         "speaker": speaker,
-        "created_at": _pick_row_created_at(row_created_at_bj, record),
+        "created_at": created_at,
         "text": text,
         "display_text": display_text,
         "in_reply_to_comment_id": str(
@@ -880,10 +907,13 @@ def _build_comment_message(
             or record.get("root_in_reply_to_status_id")
             or ""
         ).strip(),
-        "root_status_url": str(
-            context_obj.get("root_status_url") or record.get("root_status_url") or ""
-        ).strip(),
-        "talk_context": _build_talk_context(payload_obj, source_id),
+        ROOT_STATUS_URL_FIELD_NAME: root_status_url,
+        "talk_context": _build_talk_context(
+            payload_obj,
+            source_id,
+            root_status_url=root_status_url,
+            fallback_created_at=created_at,
+        ),
     }
 
     topic_status_id = str(context_obj.get("topic_status_id") or "").strip()
@@ -892,8 +922,13 @@ def _build_comment_message(
         talk_context=message["talk_context"],
         topic_status_id=topic_status_id,
         root_status_id=message["root_status_id"],
+        fallback_created_at=created_at,
     )
-    message["reply_parent_hint"] = _build_reply_parent_hint(record.get("raw_json"))
+    message["reply_parent_hint"] = _build_reply_parent_hint(
+        record.get("raw_json"),
+        root_status_url=root_status_url,
+        fallback_created_at=created_at,
+    )
 
     lines = _split_display_lines(row_text)
     if lines:
@@ -903,7 +938,7 @@ def _build_comment_message(
                 "source_kind": "topic_post",
                 "source_id": topic_status_id,
                 "speaker": topic_speaker,
-                "created_at": "",
+                "created_at": created_at,
                 "text": topic_text,
                 "display_text": lines[0],
             }
@@ -1277,7 +1312,7 @@ def _build_internal_message_payload(
         return None
 
     commentary_text, quoted_text = _split_commentary_and_quoted_text(text)
-    return {
+    payload = {
         "source_kind": source_kind,
         "source_id": source_id,
         "speaker": str(message.get("speaker") or "").strip(),
@@ -1286,6 +1321,10 @@ def _build_internal_message_payload(
         "commentary_text": commentary_text,
         "quoted_text": quoted_text,
     }
+    root_status_url = str(message.get(ROOT_STATUS_URL_FIELD_NAME) or "").strip()
+    if root_status_url:
+        payload[ROOT_STATUS_URL_FIELD_NAME] = root_status_url
+    return payload
 
 
 def _build_prompt_message_text(message: dict[str, Any]) -> str:
@@ -1544,12 +1583,15 @@ def _build_message_tree(
 
     if root_node is None:
         synthetic_text = "原帖缺失"
+        fallback_created_at = _normalize_created_at(
+            str(topic_package.get("stats", {}).get("latest_activity_at") or "").strip()
+        )
         root_node = _ConversationTreeNode(
             {
                 "source_kind": "topic_post",
                 "source_id": topic_status_id or "root",
                 "speaker": topic_post_speaker,
-                "created_at": "",
+                "created_at": fallback_created_at,
                 "text": synthetic_text,
                 "commentary_text": synthetic_text,
                 "quoted_text": "",
@@ -2664,6 +2706,8 @@ def _source_url_from_message(message: dict[str, Any]) -> str:
         return ""
     if source_kind in {"status", "topic_post"}:
         return f"https://xueqiu.com/S/{source_id}"
+    if source_kind in {"comment", "talk_reply"}:
+        return _normalize_text(message.get(ROOT_STATUS_URL_FIELD_NAME))
     return ""
 
 
