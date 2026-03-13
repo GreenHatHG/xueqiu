@@ -13,6 +13,7 @@ from .text_sanitize import sanitize_xueqiu_text
 
 
 MERGED_TABLE_NAME = "merged_records"
+RAW_TABLE_NAME = "raw_records"
 
 KIND_STATUS = "status"
 KIND_COMMENT = "comment"
@@ -907,6 +908,23 @@ class SqliteDb:
         )
         c.execute(
             "CREATE INDEX IF NOT EXISTS idx_merged_records_user_created ON merged_records(user_id, created_at_bj)"
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS raw_records (
+              merge_key TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              username TEXT NOT NULL DEFAULT '',
+              created_at_bj TEXT,
+              fetched_at_bj TEXT NOT NULL,
+              text TEXT NOT NULL DEFAULT '',
+              context_json TEXT NOT NULL DEFAULT '{}',
+              payload_json TEXT NOT NULL
+            )
+            """
+        )
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_raw_records_user_created ON raw_records(user_id, created_at_bj)"
         )
         merged_columns = {
             str(row["name"])
