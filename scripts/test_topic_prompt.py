@@ -6,6 +6,7 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -51,6 +52,7 @@ DEFAULT_AI_RETRY_BACKOFF_SEC = 2.0
 DEFAULT_AI_RETRY_MAX_BACKOFF_SEC = 32.0
 DEFAULT_AI_MAX_INFLIGHT = 32
 DEFAULT_AI_MODE = "responses"
+DEFAULT_LITELLM_DEBUG_STREAM_TAIL_CHARS = 240
 AI_MODE_COMPLETION = "completion"
 AI_MODE_RESPONSES = "responses"
 PROMPT_VERSION = "topic-prompt-v3"
@@ -64,6 +66,7 @@ TRUNCATION_RECOVERY_MIN_SNIPPET_CHARS = 24
 TRUNCATION_RECOVERY_MIN_GAIN_CHARS = 24
 
 _RE_HTML_TAG = re.compile(r"<[^>]+>")
+_RE_ANSI_ESCAPE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 warnings.filterwarnings(
     "ignore",
@@ -276,6 +279,11 @@ def _parse_args() -> argparse.Namespace:
         "--ai-stream",
         action="store_true",
         help="Enable LiteLLM streaming and rebuild final text from streamed events.",
+    )
+    parser.add_argument(
+        "--litellm-debug",
+        action="store_true",
+        help="Enable LiteLLM debug logs and capture partial stream diagnostics on failure. May be noisy.",
     )
     parser.add_argument(
         "--ai-out",
@@ -1995,6 +2003,7 @@ def _resolve_api_config(args: argparse.Namespace) -> dict[str, str]:
         "api_type": api_type,
         "api_mode": api_mode,
         "ai_stream": "1" if bool(args.ai_stream) else "",
+        "litellm_debug": "1" if bool(args.litellm_debug) else "",
         "model_name": model_name,
         "base_url": base_url,
         "api_key": api_key,
@@ -2293,17 +2302,36 @@ def _collect_streamed_ai_text(
     stream_response: Any,
     *,
     api_mode: str,
+    debug: bool = False,
 ) -> dict[str, Any]:
     chunks: list[Any] = []
     chunk_snapshots: list[Any] = []
     text_parts: list[str] = []
 
-    for chunk in stream_response:
-        chunks.append(chunk)
-        chunk_snapshots.append(_to_jsonable(chunk))
-        text_delta = _extract_stream_text_delta(chunk)
-        if text_delta:
-            text_parts.append(text_delta)
+    try:
+        for chunk in stream_response:
+            chunks.append(chunk)
+            chunk_snapshots.append(_to_jsonable(chunk))
+            text_delta = _extract_stream_text_delta(chunk)
+            if text_delta:
+                text_parts.append(text_delta)
+    except Exception as exc:
+        if bool(debug):
+            partial_text = "".join(text_parts).strip()
+            partial_tail = partial_text[-DEFAULT_LITELLM_DEBUG_STREAM_TAIL_CHARS:]
+            partial_tail = re.sub(r"\s+", " ", partial_tail).strip()
+            stream_debug = {
+                "chunk_count": len(chunk_snapshots),
+                "chunk_type_counts": _summarize_trace_chunk_types(chunk_snapshots),
+                "partial_text_len": len(partial_text),
+                "partial_text_tail": partial_tail,
+            }
+            if chunk_snapshots and isinstance(chunk_snapshots[-1], dict):
+                last_chunk_type = _normalize_text(chunk_snapshots[-1].get("type"))
+                if last_chunk_type:
+                    stream_debug["last_chunk_type"] = last_chunk_type
+            setattr(exc, "_xueqiu_stream_debug", stream_debug)
+        raise
 
     streamed_text = "".join(text_parts).strip()
     if streamed_text:
@@ -2386,6 +2414,31 @@ def _now_log_time() -> str:
 
 def _log(message: str) -> None:
     print(f"[{_now_log_time()}] {message}", file=sys.stderr)
+
+
+class _AnsiStrippingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return _RE_ANSI_ESCAPE.sub("", super().format(record))
+
+
+def _configure_litellm_logging(*, enable_debug: bool, strip_ansi: bool) -> None:
+    logger_names = ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy")
+    formatter: Optional[logging.Formatter] = None
+    if strip_ansi:
+        formatter = _AnsiStrippingFormatter(
+            "%(asctime)s - %(name)s:%(levelname)s: %(filename)s:%(lineno)s - %(message)s",
+            datefmt="%H:%M:%S",
+        )
+
+    for name in logger_names:
+        logger = logging.getLogger(name)
+        if enable_debug:
+            logger.setLevel(logging.DEBUG)
+        for handler in logger.handlers:
+            if enable_debug:
+                handler.setLevel(logging.DEBUG)
+            if formatter is not None:
+                handler.setFormatter(formatter)
 
 
 def _wait_for_ai_rpm_slot(
@@ -3226,8 +3279,12 @@ def _call_ai_for_topic(
     retry_count: int,
     temperature: float,
     reasoning_effort: str,
+    litellm_debug: bool = False,
     retry_log_label: str = "",
 ) -> dict[str, Any]:
+    if bool(litellm_debug):
+        os.environ["LITELLM_LOG"] = "DEBUG"
+
     try:
         import litellm
     except Exception as exc:
@@ -3235,8 +3292,19 @@ def _call_ai_for_topic(
             "当前环境没法导入 litellm。先装好 berriai/litellm 再跑 --call-ai。"
         ) from exc
 
-    setattr(litellm, "suppress_debug_info", True)
-    setattr(litellm, "set_verbose", False)
+    if bool(litellm_debug):
+        setattr(litellm, "suppress_debug_info", False)
+        turn_on_debug = getattr(litellm, "_turn_on_debug", None)
+        if callable(turn_on_debug):
+            try:
+                turn_on_debug()
+            except Exception:
+                pass
+        _configure_litellm_logging(
+            enable_debug=True, strip_ansi=not bool(sys.stderr.isatty())
+        )
+    else:
+        setattr(litellm, "suppress_debug_info", True)
 
     last_error: Optional[Exception] = None
     retries = max(0, int(retry_count))
@@ -3306,7 +3374,9 @@ def _call_ai_for_topic(
                     **call_kwargs,
                 )
             if ai_stream:
-                stream_result = _collect_streamed_ai_text(response, api_mode=api_mode)
+                stream_result = _collect_streamed_ai_text(
+                    response, api_mode=api_mode, debug=litellm_debug
+                )
                 raw_text = str(stream_result.get("raw_text") or "")
                 response_snapshot = stream_result.get("response_snapshot")
             else:
@@ -3330,6 +3400,7 @@ def _call_ai_for_topic(
                     "api_type": api_type,
                     "model": request_model_name,
                     "stream": bool(ai_stream),
+                    "litellm_debug": bool(litellm_debug),
                     "retries": retries,
                     "attempts": attempt_traces,
                 },
@@ -3343,6 +3414,10 @@ def _call_ai_for_topic(
                 "raw_ai_text_len": len(raw_text),
                 "error": str(exc),
             }
+            if bool(litellm_debug):
+                stream_debug = getattr(exc, "_xueqiu_stream_debug", None)
+                if isinstance(stream_debug, dict) and stream_debug:
+                    attempt_trace["stream_debug"] = stream_debug
             if raw_text:
                 attempt_trace["raw_ai_text"] = raw_text
             attempt_traces.append(attempt_trace)
@@ -3356,8 +3431,18 @@ def _call_ai_for_topic(
             capped_note = ""
             if next_wait_sec < raw_backoff_sec:
                 capped_note = f"（已封顶 {DEFAULT_AI_RETRY_MAX_BACKOFF_SEC:.0f}s）"
+            error_text = str(exc)
+            if bool(litellm_debug):
+                error_text = f"{type(exc).__name__}: {exc}"
+            stream_debug_note = ""
+            if bool(litellm_debug):
+                stream_debug = getattr(exc, "_xueqiu_stream_debug", None)
+                if isinstance(stream_debug, dict) and stream_debug:
+                    stream_debug_note = " stream_debug=" + json.dumps(
+                        stream_debug, ensure_ascii=False, sort_keys=True
+                    )
             _log(
-                f"{prefix} 内部请求第 {attempt + 1}/{total_attempts} 次失败：{exc}；{next_wait_sec:.1f}s 后重试{capped_note}。"
+                f"{prefix} 内部请求第 {attempt + 1}/{total_attempts} 次失败：{error_text}；{next_wait_sec:.1f}s 后重试{capped_note}。{stream_debug_note}"
             )
             time.sleep(next_wait_sec)
             backoff_sec = min(backoff_sec * 2, DEFAULT_AI_RETRY_MAX_BACKOFF_SEC)
@@ -3789,6 +3874,7 @@ def _process_single_topic(
         retry_count=int(args.ai_retries),
         temperature=float(args.ai_temperature),
         reasoning_effort=str(args.ai_reasoning_effort),
+        litellm_debug=bool(args.litellm_debug),
         retry_log_label=retry_log_label,
     )
     ai_result = dict(ai_call_result.get("ai_result") or {})
@@ -3894,6 +3980,7 @@ def main() -> int:
                     f"api_type={_normalize_text(api_config.get('api_type'))}",
                     f"api_mode={_normalize_text(api_config.get('api_mode'))}",
                     f"ai_stream={bool(_normalize_text(api_config.get('ai_stream')))}",
+                    f"litellm_debug={bool(_normalize_text(api_config.get('litellm_debug')))}",
                     f"model_name={_normalize_text(api_config.get('model_name'))}",
                     f"base_url={_normalize_text(api_config.get('base_url'))}",
                     f"ai_max_inflight={configured_max_inflight}",
