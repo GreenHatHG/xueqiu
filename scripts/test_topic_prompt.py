@@ -48,16 +48,22 @@ DEFAULT_AI_TEMPERATURE = 1.0
 DEFAULT_AI_TIMEOUT_SEC = 120.0
 DEFAULT_AI_RETRY_COUNT = 3
 DEFAULT_AI_RETRY_BACKOFF_SEC = 2.0
+DEFAULT_AI_RETRY_MAX_BACKOFF_SEC = 32.0
 DEFAULT_AI_MAX_INFLIGHT = 32
 DEFAULT_AI_MODE = "responses"
 AI_MODE_COMPLETION = "completion"
 AI_MODE_RESPONSES = "responses"
-PROMPT_VERSION = "topic-prompt-v2"
+PROMPT_VERSION = "topic-prompt-v3"
 TOPIC_PACKAGE_KEY_SEPARATOR = "::"
 TRACE_RESPONSE_KEYS_LIMIT = 12
 TRACE_CHUNK_TYPE_LIMIT = 8
 COVERAGE_DETAIL_LIMIT = 20
 COVERAGE_IGNORED_SKIP_REASONS = frozenset({"skip_image_only_status"})
+TRUNCATED_TEXT_SUFFIXES = ("...", "……", "…")
+TRUNCATION_RECOVERY_MIN_SNIPPET_CHARS = 24
+TRUNCATION_RECOVERY_MIN_GAIN_CHARS = 24
+
+_RE_HTML_TAG = re.compile(r"<[^>]+>")
 
 warnings.filterwarnings(
     "ignore",
@@ -563,6 +569,64 @@ def _line_to_speaker_and_text(line: str) -> tuple[str, str]:
     return speaker.strip(), body.strip()
 
 
+def _is_truncated_text(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return any(text.endswith(suffix) for suffix in TRUNCATED_TEXT_SUFFIXES)
+
+
+def _strip_truncation_suffix(value: Any) -> str:
+    text = str(value or "").strip()
+    for suffix in TRUNCATED_TEXT_SUFFIXES:
+        if text.endswith(suffix):
+            return text[: -len(suffix)].strip()
+    return text
+
+
+def _normalize_text_for_contains(value: Any) -> str:
+    cleaned = _clean_text(value)
+    if not cleaned:
+        return ""
+    cleaned = _RE_HTML_TAG.sub("", cleaned)
+    return re.sub(r"\s+", "", cleaned)
+
+
+def _recover_truncated_text_from_display_text(
+    *,
+    payload_text: str,
+    speaker: str,
+    display_text: Any,
+) -> str:
+    if not _is_truncated_text(payload_text):
+        return payload_text
+
+    snippet = _strip_truncation_suffix(payload_text)
+    snippet_norm = _normalize_text_for_contains(snippet)
+    if len(snippet_norm) < TRUNCATION_RECOVERY_MIN_SNIPPET_CHARS:
+        return payload_text
+
+    best_text = ""
+    best_norm_len = 0
+    for line in _split_display_lines(display_text):
+        line_speaker, line_body = _line_to_speaker_and_text(line)
+        if speaker and line_speaker and line_speaker != speaker:
+            continue
+        body = line_body or line
+        body_norm = _normalize_text_for_contains(body)
+        if not body_norm:
+            continue
+        if snippet_norm not in body_norm:
+            continue
+        if len(body_norm) < len(snippet_norm) + TRUNCATION_RECOVERY_MIN_GAIN_CHARS:
+            continue
+        if len(body_norm) > best_norm_len:
+            best_text = body
+            best_norm_len = len(body_norm)
+
+    return best_text.strip() if best_text else payload_text
+
+
 def _build_root_status_hint(
     *,
     row_text: Any,
@@ -674,16 +738,24 @@ def _build_status_message(
     if not text:
         return None
 
+    speaker = _speaker_from_raw_json(record.get("raw_json"), record.get("user_id"))
+    display_text = str(row_text or "").strip()
+    recovered_text = _recover_truncated_text_from_display_text(
+        payload_text=text,
+        speaker=speaker,
+        display_text=display_text,
+    )
+    if recovered_text:
+        text = recovered_text
+
     return {
         "merge_key": merge_key,
         "source_kind": "status",
         "source_id": source_id,
-        "speaker": _speaker_from_raw_json(
-            record.get("raw_json"), record.get("user_id")
-        ),
+        "speaker": speaker,
         "created_at": _pick_row_created_at(row_created_at_bj, record),
         "text": text,
-        "display_text": str(row_text or "").strip(),
+        "display_text": display_text,
         "topic_status_id": str(context_obj.get("topic_status_id") or "").strip(),
     }
 
@@ -772,16 +844,24 @@ def _build_comment_message(
     if not text:
         return None
 
+    speaker = _speaker_from_raw_json(record.get("raw_json"), record.get("user_id"))
+    display_text = str(row_text or "").strip()
+    recovered_text = _recover_truncated_text_from_display_text(
+        payload_text=text,
+        speaker=speaker,
+        display_text=display_text,
+    )
+    if recovered_text:
+        text = recovered_text
+
     message: dict[str, Any] = {
         "merge_key": merge_key,
         "source_kind": "comment",
         "source_id": source_id,
-        "speaker": _speaker_from_raw_json(
-            record.get("raw_json"), record.get("user_id")
-        ),
+        "speaker": speaker,
         "created_at": _pick_row_created_at(row_created_at_bj, record),
         "text": text,
-        "display_text": str(row_text or "").strip(),
+        "display_text": display_text,
         "in_reply_to_comment_id": str(
             record.get("in_reply_to_comment_id") or ""
         ).strip(),
@@ -858,6 +938,59 @@ def _choose_topic_post(
         if text:
             return hint, []
     return None, []
+
+
+def _recover_topic_post_text_from_topic_context(topic: dict[str, Any]) -> None:
+    topic_post = topic.get("topic_post")
+    if not isinstance(topic_post, dict):
+        return
+
+    speaker = str(topic_post.get("speaker") or "").strip()
+    if not speaker:
+        return
+
+    original_text = str(topic_post.get("text") or "").strip()
+    if not original_text:
+        return
+
+    recovered = _recover_truncated_text_from_display_text(
+        payload_text=original_text,
+        speaker=speaker,
+        display_text=topic_post.get("display_text"),
+    )
+    if recovered != original_text:
+        topic_post["text"] = recovered
+        return
+
+    if not _is_truncated_text(original_text):
+        return
+
+    best_text = original_text
+    best_norm_len = len(_normalize_text_for_contains(best_text))
+    for bucket in ("status_updates", "comments"):
+        items = topic.get(bucket) or []
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            display_text = item.get("display_text")
+            if not display_text:
+                continue
+            candidate = _recover_truncated_text_from_display_text(
+                payload_text=original_text,
+                speaker=speaker,
+                display_text=display_text,
+            )
+            if candidate == original_text:
+                continue
+            candidate_norm_len = len(_normalize_text_for_contains(candidate))
+            if candidate_norm_len > best_norm_len:
+                best_text = candidate
+                best_norm_len = candidate_norm_len
+
+    if best_text != original_text:
+        topic_post["text"] = best_text
 
 
 def _load_entry_rows(db_path: Path) -> list[sqlite3.Row]:
@@ -1081,6 +1214,7 @@ def _build_topics_from_rows(
         topic["topic_post"] = topic_post
         topic["status_updates"] = rest_statuses
         topic["comments"] = comments
+        _recover_topic_post_text_from_topic_context(topic)
         latest_activity_candidates = [
             str(item.get("created_at") or "") for item in rest_statuses
         ]
@@ -1772,7 +1906,6 @@ def _build_combined_output(topic_packages: list[dict[str, Any]]) -> str:
     for index, topic in enumerate(topic_packages, start=1):
         focus_username = _topic_focus_username(topic)
         topic_json = _build_single_topic_json(topic)
-        human_block = _build_human_topic_block(topic, index)
         sections.append(
             "\n\n".join(
                 [
@@ -1784,8 +1917,6 @@ def _build_combined_output(topic_packages: list[dict[str, Any]]) -> str:
                             "```json",
                             topic_json,
                             "```",
-                            "人工核查（纯数据库 text 拼接形态）：",
-                            human_block,
                         ]
                     ),
                 ]
@@ -1805,7 +1936,6 @@ def _build_single_topic_output(
         topic_package,
         ai_topic_package=ai_topic_package,
     )
-    human_block = _build_human_topic_block(topic_package, index)
     return (
         "\n\n".join(
             [
@@ -1817,8 +1947,6 @@ def _build_single_topic_output(
                         "```json",
                         topic_json,
                         "```",
-                        "人工核查（纯数据库 text 拼接形态）：",
-                        human_block,
                     ]
                 ),
             ]
@@ -3220,15 +3348,19 @@ def _call_ai_for_topic(
             attempt_traces.append(attempt_trace)
             if attempt >= retries:
                 break
-            next_wait_sec = float(backoff_sec)
+            raw_backoff_sec = float(backoff_sec)
+            next_wait_sec = min(raw_backoff_sec, DEFAULT_AI_RETRY_MAX_BACKOFF_SEC)
             total_attempts = retries + 1
             label = _normalize_text(retry_log_label)
             prefix = f"[ai-retry][{label}]" if label else "[ai-retry]"
+            capped_note = ""
+            if next_wait_sec < raw_backoff_sec:
+                capped_note = f"（已封顶 {DEFAULT_AI_RETRY_MAX_BACKOFF_SEC:.0f}s）"
             _log(
-                f"{prefix} 内部请求第 {attempt + 1}/{total_attempts} 次失败：{exc}；{next_wait_sec:.1f}s 后重试。"
+                f"{prefix} 内部请求第 {attempt + 1}/{total_attempts} 次失败：{exc}；{next_wait_sec:.1f}s 后重试{capped_note}。"
             )
-            time.sleep(backoff_sec)
-            backoff_sec *= 2
+            time.sleep(next_wait_sec)
+            backoff_sec = min(backoff_sec * 2, DEFAULT_AI_RETRY_MAX_BACKOFF_SEC)
 
     assert last_error is not None
     raise _AICallError(
