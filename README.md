@@ -85,7 +85,7 @@
     - `uv run xq-rss --host 0.0.0.0 --port 8000`
     - 打开：`http://127.0.0.1:8000/u/123456789?limit=20&key=your_key`
   - Docker 跑（不安装 Playwright/浏览器依赖）：
-    - 构建：`docker build -f docker/xq-rss/Dockerfile -t xq-rss .`
+    - 构建：`docker build -t xq-rss .`
     - 运行（把 SQLite 挂到 volume，重启不丢）：
       - `docker run --rm -p 8000:8000 -e XUEQIU_COOKIE='...' -e XQ_RSS_KEY='your_key' -e XQ_RSS_TTL_SEC=300 -v xq_data:/app/data xq-rss`
   - 失败行为：
