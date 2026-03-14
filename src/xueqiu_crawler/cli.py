@@ -32,6 +32,7 @@ from .constants import (
     USER_COMMENTS_PAGE_SIZE,
 )
 from .storage import (
+    MERGE_KEY_COMMENT_PREFIX,
     SqliteCrawlProgressStore,
     SqliteDb,
     SqliteMergedCommentsStore,
@@ -148,13 +149,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument(
         "--mode",
         default="core",
-        choices=["core"],
-        help="抓取内容范围（当前仅支持 core：发言+回复+查看对话，且只落库 SQLite）。",
+        choices=["core", "incremental_http"],
+        help=(
+            "抓取内容范围："
+            "core=浏览器会话抓取（发言+回复+查看对话）；"
+            "incremental_http=无浏览器增量抓取（需要环境变量 XUEQIU_COOKIE；timeline/comments 只抓一页，但 talks/detail 尽量补齐）。"
+        ),
     )
     p.add_argument(
         "--since",
         default=None,
-        help="截止时间（本地时区日期 YYYY-MM-DD 或 ISO 8601 时间）。core 模式必填：抓取 >= since 的内容，遇到更早内容则停止。",
+        help=(
+            "截止时间（本地时区日期 YYYY-MM-DD 或 ISO 8601 时间）。"
+            "core 模式必填：抓取 >= since 的内容，遇到更早内容则停止。"
+            "incremental_http 模式可选：若不提供则不做时间过滤（仍然只抓一页）。"
+        ),
     )
     p.add_argument(
         "--out", type=Path, default=DEFAULT_OUTPUT_DIR, help="输出目录（默认 data/）"
@@ -2062,6 +2071,416 @@ def _prepare_base_browser_profile(*, args: argparse.Namespace, browser_cfg) -> N
         time.sleep(BASE_PROFILE_COPY_SETTLE_SEC)
 
 
+def _crawl_timeline_one_page_via_http_api(
+    *,
+    api,
+    user_id: str,
+    since_bj: dt.datetime,
+    store: Any,
+    seen_ids: set[str],
+) -> int:
+    obj = api.fetch_timeline_first_page(str(user_id))
+    statuses = XueqiuApi.extract_timeline_statuses(obj if isinstance(obj, dict) else {})
+    batch_oldest: Optional[dt.datetime] = None
+    batch_newest: Optional[dt.datetime] = None
+    to_write: list[dict[str, Any]] = []
+    for raw in statuses:
+        if not isinstance(raw, dict):
+            continue
+        created_bj = _parse_created_at_to_beijing(raw.get("created_at"))
+        if created_bj is None:
+            continue
+        if batch_newest is None or created_bj > batch_newest:
+            batch_newest = created_bj
+        if batch_oldest is None or created_bj < batch_oldest:
+            batch_oldest = created_bj
+        if created_bj < since_bj:
+            continue
+        rec = _normalize_timeline_status(raw, str(user_id))
+        rid = rec.get(store.id_field)
+        if not rid:
+            continue
+        rid_str = str(rid)
+        if rid_str in seen_ids:
+            continue
+        seen_ids.add(rid_str)
+        to_write.append(rec)
+    inserted = store.append_many(to_write) if to_write else 0
+    print(
+        f"[timeline-http] page=1 原始 {len(statuses)} 条, 待写入 {len(to_write)} 条, 实际写入 {inserted} 条, "
+        f"日期 {_format_progress_dt(batch_newest)} -> {_format_progress_dt(batch_oldest)}",
+        file=sys.stderr,
+    )
+    return int(inserted)
+
+
+def _crawl_comments_one_page_via_http_api(
+    *,
+    api,
+    user_id: str,
+    since_bj: dt.datetime,
+    store: Any,
+    seen_ids: set[str],
+) -> tuple[int, list[dict[str, Any]]]:
+    next_max_id, items = api.fetch_user_comments_first_page(str(user_id))
+    batch_oldest: Optional[dt.datetime] = None
+    batch_newest: Optional[dt.datetime] = None
+    candidates: list[dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        created_bj = _parse_created_at_to_beijing(raw.get("created_at"))
+        if created_bj is None:
+            continue
+        if batch_newest is None or created_bj > batch_newest:
+            batch_newest = created_bj
+        if batch_oldest is None or created_bj < batch_oldest:
+            batch_oldest = created_bj
+        if created_bj < since_bj:
+            continue
+        rec = _normalize_user_comment(raw, str(user_id))
+        rid = rec.get(store.id_field)
+        if not rid:
+            continue
+        candidates.append(rec)
+
+    existing_merge_keys: set[str] = set()
+    if candidates:
+        merge_keys = [
+            f"{MERGE_KEY_COMMENT_PREFIX}{str(r.get('comment_id'))}"
+            for r in candidates
+            if r.get("comment_id")
+        ]
+        merge_keys = [mk for mk in merge_keys if mk]
+        if merge_keys:
+            placeholders = ",".join(["?"] * len(merge_keys))
+            try:
+                cur = store.db.conn.execute(
+                    f"""
+                    SELECT merge_key
+                    FROM merged_records
+                    WHERE merge_key IN ({placeholders})
+                    """,
+                    merge_keys,
+                )
+                existing_merge_keys = {str(row[0] or "") for row in cur}
+            except Exception:
+                existing_merge_keys = set()
+
+    to_write: list[dict[str, Any]] = []
+    refs: list[dict[str, Any]] = []
+    existing_count = 0
+    for rec in candidates:
+        rid = rec.get(store.id_field)
+        if not rid:
+            continue
+        rid_str = str(rid)
+        if rid_str in seen_ids:
+            continue
+        seen_ids.add(rid_str)
+        mk = f"{MERGE_KEY_COMMENT_PREFIX}{rid_str}"
+        if mk in existing_merge_keys:
+            existing_count += 1
+            continue
+        to_write.append(rec)
+        refs.append(
+            {
+                "comment_id": rec.get("comment_id"),
+                "root_in_reply_to_status_id": rec.get("root_in_reply_to_status_id"),
+                "root_status_id": rec.get("root_status_id"),
+                "created_at_bj": rec.get("created_at_bj"),
+            }
+        )
+
+    inserted = store.append_many(to_write) if to_write else 0
+    print(
+        f"[comments-http] max_id=-1 next_max_id={next_max_id} 原始 {len(items)} 条, 待写入 {len(to_write)} 条, "
+        f"已存在 {existing_count} 条, 实际写入 {inserted} 条, "
+        f"日期 {_format_progress_dt(batch_newest)} -> {_format_progress_dt(batch_oldest)}",
+        file=sys.stderr,
+    )
+    return int(inserted), refs
+
+
+def _backfill_talks_for_comment_refs(
+    *,
+    api,
+    user_id: str,
+    refs: list[dict[str, Any]],
+    max_talk_pages: int,
+    talks_store: Any,
+) -> int:
+    total = len(refs)
+    wrote = 0
+    skipped = 0
+    for idx, ref in enumerate(refs, start=1):
+        cid = str(ref.get("comment_id") or "").strip()
+        root_status_id = str(
+            ref.get("root_in_reply_to_status_id") or ref.get("root_status_id") or ""
+        ).strip()
+        if not cid or not root_status_id:
+            continue
+
+        print(
+            f"[talks-http] {idx}/{total} 开始补齐 root_status_id={root_status_id} comment_id={cid}",
+            file=sys.stderr,
+        )
+        started = time.monotonic()
+
+        meta = talks_store.get_meta(root_status_id=root_status_id, comment_id=cid)
+        if meta is not None:
+            try:
+                max_page = int(meta.get("max_page") or 0)
+                fetched_pages = int(meta.get("fetched_pages") or 0)
+                truncated = bool(meta.get("truncated"))
+            except Exception:
+                max_page = 0
+                fetched_pages = 0
+                truncated = True
+            if (
+                not truncated
+                and max_page > 0
+                and fetched_pages >= min(max_page, int(max_talk_pages))
+            ):
+                skipped += 1
+                print(
+                    f"[talks-http] {idx}/{total} 已完整（fetched_pages={fetched_pages} max_page={max_page}），跳过",
+                    file=sys.stderr,
+                )
+                continue
+            if not truncated and max_page == 0 and fetched_pages >= int(max_talk_pages):
+                skipped += 1
+                print(
+                    f"[talks-http] {idx}/{total} 已达上限（fetched_pages={fetched_pages} max_pages={int(max_talk_pages)}），跳过",
+                    file=sys.stderr,
+                )
+                continue
+
+        existing_obj = (
+            talks_store.get_existing_obj(root_status_id=root_status_id, comment_id=cid)
+            if meta
+            else None
+        )
+        obj = api.fetch_talks_incremental(
+            root_status_id=root_status_id,
+            comment_id=cid,
+            max_pages=int(max_talk_pages),
+            existing=existing_obj,
+        )
+        if isinstance(obj, dict):
+            talks_store.upsert_obj(
+                root_status_id=root_status_id,
+                comment_id=cid,
+                user_id=str(user_id),
+                obj=obj,
+            )
+            wrote += 1
+            elapsed = time.monotonic() - started
+            try:
+                fetched_pages2 = int(obj.get("fetched_pages") or 0)
+            except Exception:
+                fetched_pages2 = 0
+            try:
+                max_page2 = int(obj.get("max_page") or 0)
+            except Exception:
+                max_page2 = 0
+            truncated2 = bool(obj.get("truncated"))
+            print(
+                f"[talks-http] {idx}/{total} 完成 pages={fetched_pages2} max_page={max_page2} truncated={int(truncated2)} 耗时 {elapsed:.1f}s",
+                file=sys.stderr,
+            )
+        else:
+            print(f"[talks-http] {idx}/{total} 返回非对象，跳过写入", file=sys.stderr)
+    if total:
+        print(
+            f"[talks-http] 本轮补齐结束：写入 {wrote} 份，跳过 {skipped} 份（refs={total} max_pages={int(max_talk_pages)}）",
+            file=sys.stderr,
+        )
+    return wrote
+
+
+def _run_single_user_incremental_http(
+    *,
+    args: argparse.Namespace,
+    db: SqliteDb,
+    db_path: Path,
+    out_dir: Path,
+    user_id: str,
+    since_bj: dt.datetime,
+) -> int:
+    from .http_api import XueqiuHttpApi
+
+    api_cfg = ApiConfig(
+        min_delay_sec=args.min_delay,
+        jitter_sec=args.jitter,
+        max_retries=args.max_retries,
+        max_consecutive_blocks=args.max_consecutive_blocks,
+    )
+    timeline_store = SqliteMergedStatusesStore(db=db, user_id=str(user_id))
+    comment_store = SqliteMergedCommentsStore(db=db, user_id=str(user_id))
+    talks_store = SqliteMergedTalksStore(db=db, user_id=str(user_id))
+
+    seen_status_ids: set[str] = set()
+    seen_comment_ids: set[str] = set()
+
+    user_log_prefix = f"[user {user_id}]"
+    want_talks = bool(args.with_talks) or (not bool(args.no_talks))
+    user_started = time.monotonic()
+
+    try:
+        api = XueqiuHttpApi.from_env(api_cfg)
+    except Exception as e:
+        print(f"{user_log_prefix} HTTP 模式初始化失败：{e}", file=sys.stderr)
+        return 2
+
+    wrote_statuses = 0
+    wrote_comments = 0
+    wrote_talks = 0
+    had_blocked = False
+    refs: list[dict[str, Any]] = []
+
+    print(f"{user_log_prefix} timeline HTTP 开始抓取 page=1", file=sys.stderr)
+    timeline_started = time.monotonic()
+    try:
+        wrote_statuses = _crawl_timeline_one_page_via_http_api(
+            api=api,
+            user_id=str(user_id),
+            since_bj=since_bj,
+            store=timeline_store,
+            seen_ids=seen_status_ids,
+        )
+    except ChallengeRequiredError as e:
+        had_blocked = True
+        print(f"{user_log_prefix} timeline HTTP 被风控拦截：{e}", file=sys.stderr)
+    except BlockedError as e:
+        had_blocked = True
+        print(f"{user_log_prefix} timeline HTTP 不可用：{e}", file=sys.stderr)
+    except Exception as e:
+        print(f"{user_log_prefix} timeline HTTP 抓取失败：{e}", file=sys.stderr)
+    timeline_elapsed = time.monotonic() - timeline_started
+    print(
+        f"{user_log_prefix} timeline HTTP 结束（耗时 {timeline_elapsed:.1f}s）",
+        file=sys.stderr,
+    )
+
+    print(f"{user_log_prefix} comments HTTP 开始抓取 max_id=-1", file=sys.stderr)
+    comments_started = time.monotonic()
+    try:
+        wrote_comments, refs = _crawl_comments_one_page_via_http_api(
+            api=api,
+            user_id=str(user_id),
+            since_bj=since_bj,
+            store=comment_store,
+            seen_ids=seen_comment_ids,
+        )
+    except ChallengeRequiredError as e:
+        had_blocked = True
+        print(f"{user_log_prefix} comments HTTP 被风控拦截：{e}", file=sys.stderr)
+    except BlockedError as e:
+        had_blocked = True
+        print(f"{user_log_prefix} comments HTTP 不可用：{e}", file=sys.stderr)
+    except Exception as e:
+        print(f"{user_log_prefix} comments HTTP 抓取失败：{e}", file=sys.stderr)
+    comments_elapsed = time.monotonic() - comments_started
+    print(
+        f"{user_log_prefix} comments HTTP 结束（耗时 {comments_elapsed:.1f}s）",
+        file=sys.stderr,
+    )
+
+    if want_talks:
+        if refs:
+            print(
+                f"{user_log_prefix} talks HTTP 开始补齐（refs={len(refs)} max_pages={int(args.max_talk_pages)}）",
+                file=sys.stderr,
+            )
+            talks_started = time.monotonic()
+            try:
+                wrote_talks = _backfill_talks_for_comment_refs(
+                    api=api,
+                    user_id=str(user_id),
+                    refs=refs,
+                    max_talk_pages=int(args.max_talk_pages),
+                    talks_store=talks_store,
+                )
+            except ChallengeRequiredError as e:
+                had_blocked = True
+                print(f"{user_log_prefix} talks HTTP 被风控拦截：{e}", file=sys.stderr)
+            except BlockedError as e:
+                had_blocked = True
+                print(f"{user_log_prefix} talks HTTP 不可用：{e}", file=sys.stderr)
+            except Exception as e:
+                print(f"{user_log_prefix} talks HTTP 抓取失败：{e}", file=sys.stderr)
+            talks_elapsed = time.monotonic() - talks_started
+            print(
+                f"{user_log_prefix} talks HTTP 结束（新增/更新 {wrote_talks} 份，耗时 {talks_elapsed:.1f}s）",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"{user_log_prefix} 本轮 comments 无新增，跳过 talks 补齐。",
+                file=sys.stderr,
+            )
+
+    did_write = int(wrote_statuses + wrote_comments + wrote_talks)
+    if did_write > 0:
+        print(
+            f"{user_log_prefix} 开始重建 entry（本轮新增写入 status={wrote_statuses} comment={wrote_comments} talk={wrote_talks}）",
+            file=sys.stderr,
+        )
+        finalize_started = time.monotonic()
+        detail_cache: dict[str, Optional[str]] = {}
+
+        def resolve_status_line(
+            status_id: str,
+            source_status_url: str = "",
+            status_url: str = "",
+            status_user_id: str = "",
+        ) -> Optional[str]:
+            sid = str(status_id or "").strip()
+            if not sid:
+                return None
+            if sid in detail_cache:
+                return detail_cache[sid]
+            print(f"[detail-http] 开始补抓原帖全文 status_id={sid}", file=sys.stderr)
+            referrer = str(status_url or source_status_url or BASE_URL)
+            line, reason = api.fetch_status_display_line(sid, referrer=referrer)
+            if not line and reason:
+                print(
+                    f"[detail-http] status_id={sid} fetch failed: {reason}",
+                    file=sys.stderr,
+                )
+            detail_cache[sid] = line
+            return line
+
+        final_entries = collapse_user_records_to_entries(
+            db=db,
+            user_id=str(user_id),
+            resolve_status_line=resolve_status_line,
+        )
+        finalize_elapsed = time.monotonic() - finalize_started
+        if final_entries:
+            print(
+                f"{user_log_prefix} 最终展示记录写入 {final_entries} 条到 SQLite：{db_path}（耗时 {finalize_elapsed:.1f}s）",
+                file=sys.stderr,
+            )
+    else:
+        print(f"{user_log_prefix} 本轮无新增数据，跳过 entry 更新。", file=sys.stderr)
+
+    total_elapsed = time.monotonic() - user_started
+    print(
+        f"{user_log_prefix} HTTP 增量模式结束，耗时 {total_elapsed:.1f}s",
+        file=sys.stderr,
+    )
+    if had_blocked and did_write == 0:
+        print(
+            f"{user_log_prefix} 提示：HTTP 模式下接口被拦截/返回非 JSON。"
+            "这通常意味着 Cookie 失效或触发了 WAF 挑战页；云上无法手动验证，需要更新 Cookie 或改用浏览器模式。",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -2076,14 +2495,66 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     db_path = _resolve_db_path(args=args, out_dir=out_dir)
     cooldown_sec = max(0.0, float(args.user_cooldown_sec))
+    if args.mode == "core" and not str(args.since or "").strip():
+        print(
+            "core 模式必须提供 --since（YYYY-MM-DD 或 ISO 8601 时间）", file=sys.stderr
+        )
+        return 2
+
+    resume_since_bj: dt.datetime
+    if str(args.since or "").strip():
+        try:
+            resume_since_bj = _parse_since_to_beijing(args.since, tz_name=str(args.tz))
+        except Exception as e:
+            print(str(e), file=sys.stderr)
+            return 2
+    else:
+        # For incremental_http: `--since` is optional. Use a very old timestamp
+        # so no records on the fetched first page are filtered out.
+        resume_since_bj = dt.datetime(1970, 1, 1, tzinfo=BEIJING_TIMEZONE)
+
+    resume_since_bj_iso = resume_since_bj.replace(microsecond=0).isoformat()
+
+    print(
+        f"本次共 {len(target_user_ids)} 个用户，统一写入 SQLite：{db_path}",
+        file=sys.stderr,
+    )
+    if args.mode == "incremental_http":
+        with SqliteDb(db_path) as db:
+            total = len(target_user_ids)
+            for index, user_id in enumerate(target_user_ids, start=1):
+                print(
+                    f"开始抓取用户 {index}/{total}：{user_id}（HTTP 增量模式）",
+                    file=sys.stderr,
+                )
+                result = _run_single_user_incremental_http(
+                    args=args,
+                    db=db,
+                    db_path=db_path,
+                    out_dir=out_dir,
+                    user_id=str(user_id),
+                    since_bj=resume_since_bj,
+                )
+                if result != 0:
+                    if total > 1:
+                        print(
+                            f"用户 {user_id} 抓取失败。为保护账号，批量任务已停止，后续用户不会继续。",
+                            file=sys.stderr,
+                        )
+                    return result
+                if index < total and cooldown_sec > 0:
+                    print(
+                        f"用户 {user_id} 已完成，等待 {cooldown_sec:.1f} 秒后继续下一个用户。",
+                        file=sys.stderr,
+                    )
+                    time.sleep(cooldown_sec)
+        return 0
+
     base_user_data_dir = Path(args.user_data_dir)
     browser_profiles_root = _build_browser_profiles_root(out_dir)
-    try:
-        resume_since_bj = _parse_since_to_beijing(args.since, tz_name=str(args.tz))
-    except Exception as e:
-        print(str(e), file=sys.stderr)
-        return 2
-    resume_since_bj_iso = resume_since_bj.replace(microsecond=0).isoformat()
+
+    print(f"基础浏览器资料目录：{base_user_data_dir}", file=sys.stderr)
+    print(f"本次临时浏览器目录根路径：{browser_profiles_root}", file=sys.stderr)
 
     # Import Playwright-dependent modules only when we actually need to crawl.
     from .browser import BrowserConfig, BrowserSession
@@ -2096,13 +2567,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         reduce_automation_fingerprint=bool(args.reduce_automation_fingerprint),
         manage_cdp=True,
     )
-
-    print(
-        f"本次共 {len(target_user_ids)} 个用户，统一写入 SQLite：{db_path}",
-        file=sys.stderr,
-    )
-    print(f"基础浏览器资料目录：{base_user_data_dir}", file=sys.stderr)
-    print(f"本次临时浏览器目录根路径：{browser_profiles_root}", file=sys.stderr)
 
     try:
         _prepare_base_browser_profile(args=args, browser_cfg=base_browser_cfg)

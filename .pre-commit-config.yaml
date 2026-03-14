@@ -41,4 +41,4 @@ repos:
     rev: 'v2.14'
     hooks:
       - id: vulture
-        args: [--ignore-names, row_factory]
+        args: [--ignore-names, "row_factory,do_GET,log_message,server_version"]

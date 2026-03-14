@@ -820,8 +820,11 @@ def collapse_user_records_to_entries(
         )
     )
 
+    # Keep raw rows (status/comment/talk) so incremental runs can reuse them and
+    # extend talks snapshots later. Only replace the derived `entry:` rows.
     db.conn.execute(
-        f"DELETE FROM {MERGED_TABLE_NAME} WHERE user_id = ?", (str(user_id),)
+        f"DELETE FROM {MERGED_TABLE_NAME} WHERE user_id = ? AND merge_key LIKE ?",
+        (str(user_id), _merge_key_like(f"{KIND_ENTRY}:")),
     )
     db.conn.executemany(
         f"""

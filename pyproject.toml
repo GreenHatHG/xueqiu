@@ -21,6 +21,7 @@ dev = [
 
 [project.scripts]
 xq-crawl = "xueqiu_crawler.cli:main"
+xq-rss = "xueqiu_crawler.rss_server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -36,4 +37,4 @@ ignore_missing_imports = true
 paths = ["."]
 exclude = ["venv", ".venv", ".uv-cache"]
 sort_by_size = true
-ignore_names = ["pytest_configure"]
+ignore_names = ["pytest_configure", "do_GET", "log_message", "server_version"]
