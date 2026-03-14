@@ -7,7 +7,7 @@ app = 'xq-rss-flyctl'
 primary_region = 'iad'
 
 [build]
-  dockerfile = 'docker/xq-rss/Dockerfile'
+  dockerfile = 'Dockerfile'
 
 [env]
   XQ_RSS_TTL_SEC = '300'
