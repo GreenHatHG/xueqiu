@@ -2416,10 +2416,6 @@ def _crawl_comments_one_page_via_http_api(
             continue
         seen_ids.add(rid_str)
         mk = f"{MERGE_KEY_COMMENT_PREFIX}{rid_str}"
-        if mk in existing_merge_keys:
-            existing_count += 1
-            continue
-        to_write.append(rec)
         refs.append(
             {
                 "comment_id": rec.get("comment_id"),
@@ -2428,6 +2424,10 @@ def _crawl_comments_one_page_via_http_api(
                 "created_at_bj": rec.get("created_at_bj"),
             }
         )
+        if mk in existing_merge_keys:
+            existing_count += 1
+            continue
+        to_write.append(rec)
 
     inserted = store.append_many(to_write) if to_write else 0
     print(
@@ -2450,6 +2450,55 @@ def _backfill_talks_for_comment_refs(
     total = len(refs)
     wrote = 0
     skipped = 0
+
+    def _talks_signature(
+        obj: Optional[dict[str, Any]],
+    ) -> tuple[int, tuple[tuple[int, tuple[str, ...]], ...]]:
+        """
+        Compare only stable identifiers (page num + comment ids).
+        This avoids rewriting SQLite when the talks snapshot has no new replies.
+        """
+
+        if not isinstance(obj, dict):
+            return 0, tuple()
+        try:
+            max_page_i = int(obj.get("max_page") or 0)
+        except Exception:
+            max_page_i = 0
+        pages_obj = obj.get("pages")
+        if not isinstance(pages_obj, list):
+            return max_page_i, tuple()
+        page_sigs: list[tuple[int, tuple[str, ...]]] = []
+        for page in pages_obj:
+            if not isinstance(page, dict):
+                continue
+            try:
+                page_num = int(page.get("page") or 0)
+            except Exception:
+                continue
+            if page_num <= 0:
+                continue
+            comments_obj = page.get("comments")
+            comment_ids: list[str] = []
+            if isinstance(comments_obj, list):
+                for c in comments_obj:
+                    if not isinstance(c, dict):
+                        continue
+                    cid = c.get("id") or c.get("comment_id")
+                    if cid in (None, "", 0, "0"):
+                        continue
+                    comment_ids.append(str(cid))
+            page_sigs.append((page_num, tuple(comment_ids)))
+        page_sigs.sort(key=lambda item: item[0])
+        return max_page_i, tuple(page_sigs)
+
+    def _talks_changed(
+        existing: Optional[dict[str, Any]], current: Optional[dict[str, Any]]
+    ) -> bool:
+        if existing is None:
+            return True
+        return _talks_signature(existing) != _talks_signature(current)
+
     for idx, ref in enumerate(refs, start=1):
         cid = str(ref.get("comment_id") or "").strip()
         root_status_id = str(
@@ -2463,40 +2512,9 @@ def _backfill_talks_for_comment_refs(
             file=sys.stderr,
         )
         started = time.monotonic()
-
-        meta = talks_store.get_meta(root_status_id=root_status_id, comment_id=cid)
-        if meta is not None:
-            try:
-                max_page = int(meta.get("max_page") or 0)
-                fetched_pages = int(meta.get("fetched_pages") or 0)
-                truncated = bool(meta.get("truncated"))
-            except Exception:
-                max_page = 0
-                fetched_pages = 0
-                truncated = True
-            if (
-                not truncated
-                and max_page > 0
-                and fetched_pages >= min(max_page, int(max_talk_pages))
-            ):
-                skipped += 1
-                print(
-                    f"[talks-http] {idx}/{total} 已完整（fetched_pages={fetched_pages} max_page={max_page}），跳过",
-                    file=sys.stderr,
-                )
-                continue
-            if not truncated and max_page == 0 and fetched_pages >= int(max_talk_pages):
-                skipped += 1
-                print(
-                    f"[talks-http] {idx}/{total} 已达上限（fetched_pages={fetched_pages} max_pages={int(max_talk_pages)}），跳过",
-                    file=sys.stderr,
-                )
-                continue
-
-        existing_obj = (
-            talks_store.get_existing_obj(root_status_id=root_status_id, comment_id=cid)
-            if meta
-            else None
+        existing_obj = talks_store.get_existing_obj(
+            root_status_id=root_status_id,
+            comment_id=cid,
         )
         obj = api.fetch_talks_incremental(
             root_status_id=root_status_id,
@@ -2505,6 +2523,22 @@ def _backfill_talks_for_comment_refs(
             existing=existing_obj,
         )
         if isinstance(obj, dict):
+            if not _talks_changed(existing_obj, obj):
+                skipped += 1
+                elapsed = time.monotonic() - started
+                try:
+                    fetched_pages2 = int(obj.get("fetched_pages") or 0)
+                except Exception:
+                    fetched_pages2 = 0
+                try:
+                    max_page2 = int(obj.get("max_page") or 0)
+                except Exception:
+                    max_page2 = 0
+                print(
+                    f"[talks-http] {idx}/{total} 无新增 replies（pages={fetched_pages2} max_page={max_page2}），跳过写入，耗时 {elapsed:.1f}s",
+                    file=sys.stderr,
+                )
+                continue
             talks_store.upsert_obj(
                 root_status_id=root_status_id,
                 comment_id=cid,

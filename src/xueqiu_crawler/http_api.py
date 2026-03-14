@@ -425,6 +425,7 @@ class XueqiuHttpApi:
         max_pages: int,
         existing: Optional[dict[str, Any]],
     ) -> dict[str, Any]:
+        max_pages_i = max(1, int(max_pages))
         existing_pages: list[dict[str, Any]] = []
         pages_obj = existing.get("pages") if existing else None
         if isinstance(pages_obj, list):
@@ -432,24 +433,23 @@ class XueqiuHttpApi:
                 page_obj for page_obj in pages_obj if isinstance(page_obj, dict)
             ]
 
-        fetched_page_nums: set[int] = set()
+        existing_pages_by_num: dict[int, dict[str, Any]] = {}
         for page_obj in existing_pages:
             try:
-                page_value = page_obj.get("page")
-                if page_value is None:
-                    continue
-                fetched_page_nums.add(int(page_value))
+                page_num = int(page_obj.get("page") or 0)
             except Exception:
                 continue
+            if page_num <= 0:
+                continue
+            existing_pages_by_num[page_num] = page_obj
 
-        if existing_pages and not fetched_page_nums:
+        if existing_pages and not existing_pages_by_num:
+            # Fast path: if we cannot determine progress, fall back to full fetch.
             return self.fetch_talks_all_pages(
                 root_status_id=root_status_id,
                 comment_id=comment_id,
-                max_pages=int(max_pages),
+                max_pages=max_pages_i,
             )
-
-        start_page = (max(fetched_page_nums) + 1) if fetched_page_nums else 1
 
         ref = f"{BASE_URL}/status/{root_status_id}"
         first_url = self.build_url(
@@ -466,24 +466,32 @@ class XueqiuHttpApi:
             first_url,
             referrer=ref,
             retry_reason=lambda payload: self._describe_collection_payload_issue(
-                payload, list_key="comments", allow_empty=False
+                payload, list_key="comments", allow_empty=True
             ),
             request_label=f"talks root={root_status_id} comment={comment_id} page=1",
         )
         if not isinstance(first, dict):
             raise RuntimeError("talks payload is not an object")
         max_page_reported = int(first.get("maxPage") or 1)
-        max_page_target = min(max_page_reported, int(max_pages))
+        max_page_target = min(max_page_reported, max_pages_i)
 
-        pages_out: list[dict[str, Any]] = list(existing_pages)
+        # Merge pages by page number to support:
+        # - filling missing pages (previous partial runs)
+        # - refreshing the last fetched page (new replies may appear without maxPage increasing)
+        pages_by_num: dict[int, dict[str, Any]] = dict(existing_pages_by_num)
+        pages_by_num[1] = first
 
-        if start_page == 1:
-            pages_out = [first]
-            start_page = 2
+        last_fetched = max(pages_by_num) if pages_by_num else 1
+        refresh_page = min(max_page_target, last_fetched)
 
-        for page_num in range(start_page, max_page_target + 1):
-            if page_num in fetched_page_nums:
-                continue
+        need_pages: set[int] = set()
+        for p in range(2, max_page_target + 1):
+            if p not in pages_by_num:
+                need_pages.add(p)
+        if refresh_page >= 2:
+            need_pages.add(refresh_page)
+
+        for page_num in sorted(need_pages):
             url = self.build_url(
                 "/statuses/talks.json",
                 {
@@ -503,13 +511,11 @@ class XueqiuHttpApi:
                 request_label=f"talks root={root_status_id} comment={comment_id} page={page_num}",
             )
             if isinstance(obj, dict):
-                pages_out.append(obj)
-                page_raw = obj.get("page")
-                if page_raw is not None:
-                    try:
-                        fetched_page_nums.add(int(page_raw))
-                    except Exception:
-                        pass
+                pages_by_num[page_num] = obj
+
+        pages_out = [
+            pages_by_num[p] for p in sorted(pages_by_num) if 1 <= p <= max_page_target
+        ]
 
         return {
             "root_status_id": root_status_id,
