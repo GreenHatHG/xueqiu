@@ -9,8 +9,11 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONPATH=/app/src
 
-# Copy only source code (stdlib-only runtime path).
+# Copy only source code.
 COPY src /app/src
+
+# Install only RSS server runtime deps (avoid Playwright).
+RUN python -m pip install --no-cache-dir "fastapi>=0.111.0" "uvicorn>=0.30.0"
 
 # Persistent data (SQLite) should be mounted here.
 RUN mkdir -p /app/data

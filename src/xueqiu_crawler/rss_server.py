@@ -4,15 +4,18 @@ import argparse
 import datetime as dt
 import json
 import os
+import sys
 import threading
 from dataclasses import dataclass
 from email.utils import format_datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 from xml.etree import ElementTree as ET
 from zoneinfo import ZoneInfo
+
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse, Response
 
 from . import cli as cli_lib
 from .constants import (
@@ -50,6 +53,8 @@ BEIJING_TZ = ZoneInfo(BEIJING_TIMEZONE_NAME)
 
 _USER_LOCKS: dict[str, threading.Lock] = {}
 _USER_LOCKS_GUARD = threading.Lock()
+
+DEFAULT_ROOT_TEXT = "ok\nTry: /u/{user_id}?limit=20&key=YOUR_KEY\n"
 
 
 def _get_user_lock(user_id: str) -> threading.Lock:
@@ -308,144 +313,131 @@ def _refresh_user_incremental_http(
     )
 
 
-class _RssHttpServer(ThreadingHTTPServer):
-    _db_path: str
+app = FastAPI()
+# Keep CLI args in app state so both `python -m ...` and `uvicorn module:app` work.
+app.state.cli_db_path = ""
 
 
-class _Handler(BaseHTTPRequestHandler):
-    server_version = "xq-rss/0.1"
-
-    def address_string(self) -> str:  # noqa: D401
-        # Avoid reverse DNS lookups (slow/unreliable in containers).
+@app.middleware("http")
+async def _access_log(request: Request, call_next):  # type: ignore[no-untyped-def]
+    # Custom access log to avoid leaking `key=...` in query strings.
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Let FastAPI/uvicorn handle stack traces; still print a small log line.
+        client_host = "-"
         try:
-            return str(self.client_address[0])
+            client_host = str(request.client.host) if request.client else "-"
         except Exception:
-            return "-"
+            client_host = "-"
+        raw_path = str(request.url.path or "")
+        if request.url.query:
+            raw_path = f"{raw_path}?{request.url.query}"
+        safe_path = _mask_key_in_path(raw_path)
+        print(f"[rss] {client_host} {request.method} {safe_path} - 500", flush=True)
+        raise
 
-    def _send_text(self, code: int, text: str, *, content_type: str) -> None:
-        data = (text or "").encode("utf-8", errors="replace")
-        self.send_response(int(code))
-        self.send_header("content-type", content_type)
-        self.send_header("content-length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+    client_host = "-"
+    try:
+        client_host = str(request.client.host) if request.client else "-"
+    except Exception:
+        client_host = "-"
+    raw_path = str(request.url.path or "")
+    if request.url.query:
+        raw_path = f"{raw_path}?{request.url.query}"
+    safe_path = _mask_key_in_path(raw_path)
+    print(
+        f"[rss] {client_host} {request.method} {safe_path} - {response.status_code}",
+        flush=True,
+    )
+    return response
 
-    def _send_rss(self, xml_bytes: bytes) -> None:
-        data = xml_bytes or b""
-        self.send_response(200)
-        self.send_header("content-type", "application/rss+xml; charset=utf-8")
-        self.send_header("content-length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
 
-    def do_GET(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        path = str(parsed.path or "").strip()
-        if path in ("", "/"):
-            self._send_text(
-                200,
-                "ok\nTry: /u/{user_id}?limit=20&key=YOUR_KEY\n",
-                content_type="text/plain; charset=utf-8",
-            )
-            return
-        if path == "/healthz":
-            self._send_text(200, "ok\n", content_type="text/plain; charset=utf-8")
-            return
+@app.get("/")
+def root() -> PlainTextResponse:
+    return PlainTextResponse(DEFAULT_ROOT_TEXT, status_code=200)
 
-        if not path.startswith("/u/"):
-            self._send_text(
-                404, "not found\n", content_type="text/plain; charset=utf-8"
-            )
-            return
 
-        user_id = path[len("/u/") :].strip().strip("/")
-        if not user_id:
-            self._send_text(
-                400, "user_id 为空\n", content_type="text/plain; charset=utf-8"
-            )
-            return
+@app.get("/healthz")
+def healthz() -> PlainTextResponse:
+    return PlainTextResponse("ok\n", status_code=200)
 
-        expected_key = _env_str(XQ_RSS_KEY_ENV)
-        if not expected_key:
-            self._send_text(
-                503,
-                "服务没配 XQ_RSS_KEY\n",
-                content_type="text/plain; charset=utf-8",
-            )
-            return
 
+@app.get("/u/{user_id}")
+def user_rss(user_id: str, request: Request) -> Response:
+    uid = str(user_id or "").strip()
+    if not uid:
+        return PlainTextResponse("user_id 为空\n", status_code=400)
+
+    expected_key = _env_str(XQ_RSS_KEY_ENV)
+    if not expected_key:
+        return PlainTextResponse("服务没配 XQ_RSS_KEY\n", status_code=503)
+
+    try:
+        query = parse_qs(str(request.url.query or ""))
+        got_key = _query_first(query, RSS_KEY_QUERY_PARAM)
+        if not got_key or got_key != expected_key:
+            return PlainTextResponse("key 不对\n", status_code=401)
+        limit = _parse_limit(query)
+    except Exception as e:
+        return PlainTextResponse(
+            f"bad request: {e}\n", status_code=400, media_type="text/plain"
+        )
+
+    ttl_sec = _env_int(XQ_RSS_TTL_SEC_ENV, DEFAULT_TTL_SEC)
+    cli_db_path = str(getattr(request.app.state, "cli_db_path", "") or "").strip()
+    db_path = _resolve_db_path(cli_db_path)
+
+    # Keep it simple: per-user lock in-process, 1 uvicorn worker by default.
+    lock = _get_user_lock(uid)
+    with lock:
         try:
-            query = parse_qs(str(parsed.query or ""))
-            got_key = _query_first(query, RSS_KEY_QUERY_PARAM)
-            if not got_key or got_key != expected_key:
-                self._send_text(
-                    401,
-                    "key 不对\n",
-                    content_type="text/plain; charset=utf-8",
+            with SqliteDb(db_path) as db:
+                progress_store = SqliteCrawlProgressStore(db=db, user_id=str(uid))
+                progress = progress_store.get(
+                    since_bj_iso=RSS_PROGRESS_SINCE_BJ_ISO, stage=RSS_PROGRESS_STAGE
                 )
-                return
-            limit = _parse_limit(query)
+                now = dt.datetime.now(tz=BEIJING_TZ)
+                last_updated_at = (
+                    str(progress.get("updated_at_bj") or "") if progress else ""
+                )
+                if _should_refresh(
+                    now=now,
+                    last_updated_at_bj=last_updated_at,
+                    ttl_sec=int(ttl_sec),
+                ):
+                    _refresh_user_incremental_http(
+                        db=db, db_path=db_path, user_id=str(uid)
+                    )
+
+                entries = _query_latest_entries(
+                    db=db, user_id=str(uid), limit=int(limit)
+                )
+                xml_bytes = _build_rss_xml(user_id=str(uid), entries=entries)
         except Exception as e:
-            self._send_text(
-                400, f"bad request: {e}\n", content_type="text/plain; charset=utf-8"
+            # Fail closed: if refresh fails, return a non-200 so monitoring can catch it.
+            return PlainTextResponse(
+                f"upstream failed: {e}\n",
+                status_code=502,
+                media_type="text/plain; charset=utf-8",
             )
-            return
 
-        ttl_sec = _env_int(XQ_RSS_TTL_SEC_ENV, DEFAULT_TTL_SEC)
-        db_path = _resolve_db_path(getattr(self.server, "_db_path", None))
-
-        lock = _get_user_lock(user_id)
-        with lock:
-            try:
-                with SqliteDb(db_path) as db:
-                    progress_store = SqliteCrawlProgressStore(
-                        db=db, user_id=str(user_id)
-                    )
-                    progress = progress_store.get(
-                        since_bj_iso=RSS_PROGRESS_SINCE_BJ_ISO, stage=RSS_PROGRESS_STAGE
-                    )
-                    now = dt.datetime.now(tz=BEIJING_TZ)
-                    last_updated_at = (
-                        str(progress.get("updated_at_bj") or "") if progress else ""
-                    )
-                    if _should_refresh(
-                        now=now,
-                        last_updated_at_bj=last_updated_at,
-                        ttl_sec=int(ttl_sec),
-                    ):
-                        _refresh_user_incremental_http(
-                            db=db, db_path=db_path, user_id=str(user_id)
-                        )
-
-                    entries = _query_latest_entries(
-                        db=db, user_id=str(user_id), limit=int(limit)
-                    )
-                    xml_bytes = _build_rss_xml(user_id=str(user_id), entries=entries)
-            except Exception as e:
-                # Fail closed: if refresh fails, return a non-200 so monitoring can catch it.
-                self._send_text(
-                    502,
-                    f"upstream failed: {e}\n",
-                    content_type="text/plain; charset=utf-8",
-                )
-                return
-
-        self._send_rss(xml_bytes)
-
-    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
-        # Keep logs compact and stdlib-only.
-        msg = fmt % args if args else fmt
-        safe_path = _mask_key_in_path(self.path)
-        raw_requestline = str(getattr(self, "requestline", "") or "")
-        if raw_requestline and raw_requestline in msg:
-            safe_requestline = (
-                f"{self.command} {safe_path} {str(getattr(self, 'request_version', '') or '').strip()}"
-            ).strip()
-            msg = msg.replace(raw_requestline, safe_requestline)
-        print(f"[rss] {self.address_string()} {self.command} {safe_path} - {msg}")
+    return Response(content=xml_bytes, media_type="application/rss+xml; charset=utf-8")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    import uvicorn
+
+    def _argv_has(raw: list[str], flag: str) -> bool:
+        f = str(flag or "").strip()
+        if not f:
+            return False
+        for item in raw:
+            s = str(item or "").strip()
+            if s == f or s.startswith(f"{f}="):
+                return True
+        return False
+
     p = argparse.ArgumentParser(prog="xq-rss")
     p.add_argument("--host", default="0.0.0.0", help="listen host (default 0.0.0.0)")
     p.add_argument("--port", type=int, default=8000, help="listen port (default 8000)")
@@ -461,11 +453,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     host = str(args.host or "0.0.0.0").strip() or "0.0.0.0"
     port = int(args.port or 8000)
+    raw_argv = sys.argv[1:] if argv is None else list(argv)
+    if not _argv_has(raw_argv, "--port"):
+        env_port = str(os.environ.get("PORT", "") or "").strip()
+        if env_port:
+            try:
+                port = int(env_port)
+            except Exception:
+                pass
 
-    httpd = _RssHttpServer((host, port), _Handler)
-    httpd._db_path = str(args.db or "").strip()
+    app.state.cli_db_path = str(args.db or "").strip()
     print(f"[rss] listen http://{host}:{port}", flush=True)
-    httpd.serve_forever()
+    uvicorn.run(app, host=host, port=int(port), workers=1, access_log=False)
     return 0
 
 

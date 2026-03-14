@@ -8,8 +8,10 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
   "litellm>=1.82.1",
+  "fastapi>=0.111.0",
   "playwright>=1.41",
   "playwright-stealth>=2.0.2",
+  "uvicorn>=0.30.0",
 ]
 
 [dependency-groups]
@@ -37,4 +39,13 @@ ignore_missing_imports = true
 paths = ["."]
 exclude = ["venv", ".venv", ".uv-cache"]
 sort_by_size = true
-ignore_names = ["pytest_configure", "do_GET", "log_message", "server_version"]
+ignore_names = [
+  "pytest_configure",
+  "do_GET",
+  "log_message",
+  "server_version",
+  "_access_log",
+  "root",
+  "healthz",
+  "user_rss",
+]

@@ -73,11 +73,13 @@
   - Note: `--since` is required only for `--mode core` (browser backfill).
 - RSS 服务（按 user_id 实时出前几条）：
   - 先说一句：这个服务会用 SQLite 当缓存；TTL 内只读库，TTL 过了会先跑一次增量抓取再返回 RSS。
+  - Server：`FastAPI` + `uvicorn`（ASGI）；默认建议只跑 1 个 worker（SQLite 文件锁 + 进程间不共享锁）
   - 环境变量：
     - `XUEQIU_COOKIE`：必须（抓取用；TTL 内如果不触发抓取，可以暂时不需要）
     - `XQ_RSS_KEY`：必须（访问 RSS 时要带 `key`）
     - `XQ_RSS_TTL_SEC`：缓存秒数（默认 300）
     - `XQ_RSS_DB_PATH`：SQLite 路径（默认 `data/xueqiu_batch.sqlite3`）
+    - `PORT`：可选（不传 `--port` 时会用它）
   - 本地跑：
     - `export XUEQIU_COOKIE='xq_a_token=...; u=...; ...'`
     - `export XQ_RSS_KEY='your_key'`
