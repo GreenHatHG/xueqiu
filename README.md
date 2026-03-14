@@ -62,6 +62,8 @@
 
 - 最小可用：
   `uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06`
+- 增量更新（抓取同一批用户的最新内容；首次跑新用户仍需要 --since 初始化）：
+  `uv run xq-crawl --user-list-file data/user_ids.txt --incremental`
 - Browserless incremental (HTTP, no Playwright/Chrome):
   - Requires `XUEQIU_COOKIE` (full Cookie header value)
   - Fetches only **1 page** for timeline + comments each run, but still backfills talks/detail best-effort
@@ -103,6 +105,28 @@
 - `timeline` 还是走主页浏览 + 页面拦截，但现在会记住已经跑过的批次，停掉后会先快进再继续
 - `comments` 会优先在当前浏览器会话里直接拿数据；如果重试后还是不对，或者根本没拿到回复 JSON，会留 HTML 快照
 - `talks` 默认会尽量补
+
+### Incremental mode (`--incremental`)
+
+- A per-user checkpoint (watermark) is stored in SQLite table `crawl_checkpoints`.
+- Newly crawled `status/comment/talk` rows are written into `raw_records` (de-duped by `merge_key`).
+- `merged_records` is treated as a **derived reading table** containing only `entry:*` rows:
+  - It is rebuilt from `raw_records` **only when** the current run wrote any new raw rows.
+  - If a run finds no new content, it will **not** rewrite `merged_records`.
+- Legacy (non-incremental) mode also follows the same **raw-first** storage pipeline:
+  - Write `status/comment/talk` into `raw_records` first
+  - Rebuild `entry:*` into `merged_records` from `raw_records`
+- For a user with no checkpoint and no `raw_records` history, you must still provide `--since` once.
+
+### Repair: fix truncated original status text ([detail])
+
+This repairs “truncated original/quoted status preview” (first display line endswith `...` / `…`) by:
+
+- launching a logged-in browser session
+- rebuilding `entry:*` rows in `merged_records` from `raw_records`
+- best-effort re-fetching the original status detail page during rebuild ([detail])
+
+`uv run python scripts/repair_truncated_details.py --db data/xueqiu_batch.sqlite3`
 
 ## 4. 每个用户的新浏览器
 

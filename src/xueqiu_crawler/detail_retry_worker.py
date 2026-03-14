@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 from playwright.sync_api import sync_playwright
 
@@ -68,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
         "line": None,
         "failure_reason": None,
         "stealth_mode": None,
+        "debug": {},
     }
     try:
         with sync_playwright() as pw:
@@ -76,14 +77,17 @@ def main(argv: list[str] | None = None) -> int:
             result["stealth_mode"] = _apply_stealth(page) or ""
             api = XueqiuApi(page, api_cfg)
             try:
+                debug: dict[str, Any] = {}
                 line, failure_reason = api.fetch_status_display_line(
                     str(args.status_id or "").strip(),
                     source_status_url=str(args.source_status_url or "").strip(),
                     status_url=str(args.status_url or "").strip(),
                     status_user_id=str(args.status_user_id or "").strip(),
+                    debug=debug,
                 )
                 result["line"] = line
                 result["failure_reason"] = failure_reason
+                result["debug"] = debug
             finally:
                 browser.close()
     except Exception as exc:

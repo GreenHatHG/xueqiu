@@ -27,6 +27,7 @@ MERGE_KEY_ENTRY_STATUS_PREFIX = f"{KIND_ENTRY}:status:"
 MERGE_KEY_ENTRY_CHAIN_PREFIX = f"{KIND_ENTRY}:chain:"
 CRAWL_PROGRESS_TABLE_NAME = "crawl_progress"
 TALKS_PROGRESS_TABLE_NAME = "talks_progress"
+CRAWL_CHECKPOINTS_TABLE_NAME = "crawl_checkpoints"
 USERNAME_COLUMN_NAME = "username"
 
 DEFAULT_TALK_TEXT_MAX_CHARS = 4000
@@ -465,7 +466,10 @@ def _looks_like_truncated_display_line(text: Any) -> bool:
     if not parts:
         return False
     first = parts[0].strip()
-    return first.endswith("...") or first.endswith("…")
+    if first.endswith("..."):
+        return True
+    # Chinese ellipsis punctuation is often "……" (two chars). Treat it as NOT truncated.
+    return first.endswith("…") and (not first.endswith("……"))
 
 
 def _load_json_text(value: Any) -> dict[str, Any]:
@@ -615,11 +619,15 @@ def _enrich_status_text_with_full_original(
     if not retweeted_status_id:
         return out
 
+    status_user_id = _retweet_status_user_id_from_status_record(status_record)
+    if not status_user_id:
+        status_user_id = str(status_record.get("user_id") or "").strip()
+
     full_line = resolve_status_line(
         str(retweeted_status_id),
         _status_url_from_record(status_record),
         _retweet_status_url_from_status_record(status_record),
-        _retweet_status_user_id_from_status_record(status_record),
+        status_user_id,
     )
     if not full_line:
         return out
@@ -636,11 +644,111 @@ def collapse_user_records_to_entries(
     user_id: str,
     resolve_status_line: Optional[Callable[[str, str, str, str], Optional[str]]] = None,
 ) -> int:
+    final_entries = _build_user_entries(
+        db=db,
+        user_id=user_id,
+        source_table_name=MERGED_TABLE_NAME,
+        resolve_status_line=resolve_status_line,
+    )
+    if not final_entries:
+        return 0
+
+    db.conn.execute(
+        f"DELETE FROM {MERGED_TABLE_NAME} WHERE user_id = ? AND merge_key LIKE ?",
+        (str(user_id), _merge_key_like(f"{KIND_ENTRY}:")),
+    )
+    db.conn.executemany(
+        f"""
+        INSERT INTO {MERGED_TABLE_NAME}(
+          merge_key, user_id, username, created_at_bj, fetched_at_bj, text, context_json, payload_json
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                str(item.get("merge_key") or ""),
+                str(user_id),
+                str(item.get("username") or ""),
+                item.get("created_at_bj"),
+                item.get("fetched_at_bj") or _beijing_iso_now(),
+                str(item.get("text") or EMPTY_TEXT_PLACEHOLDER),
+                str(item.get("context_json") or CONTEXT_JSON_DEFAULT),
+                str(item.get("payload_json") or "{}"),
+            )
+            for item in final_entries
+            if item.get("merge_key")
+        ],
+    )
+    db.conn.commit()
+    return len(final_entries)
+
+
+def rebuild_user_entries_from_raw_records(
+    *,
+    db: "SqliteDb",
+    user_id: str,
+    resolve_status_line: Optional[Callable[[str, str, str, str], Optional[str]]] = None,
+) -> int:
+    """
+    Rebuild `entry:*` rows in merged_records from raw_records.
+
+    Incremental-friendly behavior:
+    - Read sources from raw_records
+    - Delete only existing `entry:*` rows in merged_records for the user
+    """
+
+    final_entries = _build_user_entries(
+        db=db,
+        user_id=user_id,
+        source_table_name=RAW_TABLE_NAME,
+        resolve_status_line=resolve_status_line,
+    )
+    if not final_entries:
+        return 0
+
+    db.conn.execute(
+        f"DELETE FROM {MERGED_TABLE_NAME} WHERE user_id = ? AND merge_key LIKE ?",
+        (
+            str(user_id),
+            _merge_key_like(f"{KIND_ENTRY}:"),
+        ),
+    )
+    db.conn.executemany(
+        f"""
+        INSERT INTO {MERGED_TABLE_NAME}(
+          merge_key, user_id, username, created_at_bj, fetched_at_bj, text, context_json, payload_json
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                str(item.get("merge_key") or ""),
+                str(user_id),
+                str(item.get("username") or ""),
+                item.get("created_at_bj"),
+                item.get("fetched_at_bj") or _beijing_iso_now(),
+                str(item.get("text") or EMPTY_TEXT_PLACEHOLDER),
+                str(item.get("context_json") or CONTEXT_JSON_DEFAULT),
+                str(item.get("payload_json") or "{}"),
+            )
+            for item in final_entries
+            if item.get("merge_key")
+        ],
+    )
+    db.conn.commit()
+    return len(final_entries)
+
+
+def _build_user_entries(
+    *,
+    db: "SqliteDb",
+    user_id: str,
+    source_table_name: str,
+    resolve_status_line: Optional[Callable[[str, str, str, str], Optional[str]]] = None,
+) -> list[dict[str, Any]]:
     rows = list(
         db.conn.execute(
             f"""
             SELECT merge_key, created_at_bj, fetched_at_bj, text, context_json, payload_json
-            FROM {MERGED_TABLE_NAME}
+            FROM {source_table_name}
             WHERE user_id = ?
               AND (
                 merge_key LIKE ?
@@ -658,7 +766,7 @@ def collapse_user_records_to_entries(
         )
     )
     if not rows:
-        return 0
+        return []
 
     statuses_by_id: dict[str, dict[str, Any]] = {}
     comments_by_id: dict[str, dict[str, Any]] = {}
@@ -819,36 +927,7 @@ def collapse_user_records_to_entries(
             str(item.get("merge_key") or ""),
         )
     )
-
-    # Keep raw rows (status/comment/talk) so incremental runs can reuse them and
-    # extend talks snapshots later. Only replace the derived `entry:` rows.
-    db.conn.execute(
-        f"DELETE FROM {MERGED_TABLE_NAME} WHERE user_id = ? AND merge_key LIKE ?",
-        (str(user_id), _merge_key_like(f"{KIND_ENTRY}:")),
-    )
-    db.conn.executemany(
-        f"""
-        INSERT INTO {MERGED_TABLE_NAME}(
-          merge_key, user_id, username, created_at_bj, fetched_at_bj, text, context_json, payload_json
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            (
-                str(item.get("merge_key") or ""),
-                str(user_id),
-                str(item.get("username") or ""),
-                item.get("created_at_bj"),
-                item.get("fetched_at_bj") or _beijing_iso_now(),
-                str(item.get("text") or EMPTY_TEXT_PLACEHOLDER),
-                str(item.get("context_json") or CONTEXT_JSON_DEFAULT),
-                str(item.get("payload_json") or "{}"),
-            )
-            for item in final_entries
-            if item.get("merge_key")
-        ],
-    )
-    db.conn.commit()
-    return len(final_entries)
+    return final_entries
 
 
 class SqliteDb:
@@ -968,20 +1047,84 @@ class SqliteDb:
             )
             """
         )
+        c.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {CRAWL_CHECKPOINTS_TABLE_NAME} (
+              user_id TEXT PRIMARY KEY,
+              checkpoint_bj_iso TEXT NOT NULL,
+              updated_at_bj TEXT NOT NULL,
+              detail_json TEXT NOT NULL DEFAULT '{{}}'
+            )
+            """
+        )
         c.commit()
+
+
+@dataclass(frozen=True)
+class SqliteCrawlCheckpointStore:
+    db: SqliteDb
+
+    def get(self, *, user_id: str) -> Optional[dict[str, Any]]:
+        row = self.db.conn.execute(
+            f"""
+            SELECT checkpoint_bj_iso, updated_at_bj, detail_json
+            FROM {CRAWL_CHECKPOINTS_TABLE_NAME}
+            WHERE user_id = ?
+            """,
+            (str(user_id),),
+        ).fetchone()
+        if not row:
+            return None
+        checkpoint = str(row["checkpoint_bj_iso"] or "").strip()
+        if not checkpoint:
+            return None
+        detail = _try_load_json_obj(row["detail_json"]) or {}
+        return {
+            "user_id": str(user_id),
+            "checkpoint_bj_iso": checkpoint,
+            "updated_at_bj": str(row["updated_at_bj"] or ""),
+            "detail": detail,
+        }
+
+    def upsert(
+        self,
+        *,
+        user_id: str,
+        checkpoint_bj_iso: str,
+        detail: Optional[dict[str, Any]] = None,
+    ) -> None:
+        self.db.conn.execute(
+            f"""
+            INSERT INTO {CRAWL_CHECKPOINTS_TABLE_NAME}(
+              user_id, checkpoint_bj_iso, updated_at_bj, detail_json
+            ) VALUES(?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+              checkpoint_bj_iso = excluded.checkpoint_bj_iso,
+              updated_at_bj = excluded.updated_at_bj,
+              detail_json = excluded.detail_json
+            """,
+            (
+                str(user_id),
+                str(checkpoint_bj_iso),
+                _beijing_iso_now(),
+                json.dumps(detail or {}, ensure_ascii=False),
+            ),
+        )
+        self.db.conn.commit()
 
 
 @dataclass(frozen=True)
 class SqliteMergedStatusesStore:
     db: SqliteDb
     user_id: str
+    table_name: str = MERGED_TABLE_NAME
     id_field: str = "status_id"
 
     def append_many(self, records: Iterable[dict[str, Any]]) -> int:
         before = int(self.db.conn.total_changes)
         self.db.conn.executemany(
             f"""
-            INSERT OR IGNORE INTO {MERGED_TABLE_NAME}(
+            INSERT OR IGNORE INTO {self.table_name}(
               merge_key, user_id, username, created_at_bj, fetched_at_bj, text, context_json, payload_json
             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -1008,13 +1151,14 @@ class SqliteMergedStatusesStore:
 class SqliteMergedCommentsStore:
     db: SqliteDb
     user_id: str
+    table_name: str = MERGED_TABLE_NAME
     id_field: str = "comment_id"
 
     def append_many(self, records: Iterable[dict[str, Any]]) -> int:
         before = int(self.db.conn.total_changes)
         self.db.conn.executemany(
             f"""
-            INSERT OR IGNORE INTO {MERGED_TABLE_NAME}(
+            INSERT OR IGNORE INTO {self.table_name}(
               merge_key, user_id, username, created_at_bj, fetched_at_bj, text, context_json, payload_json
             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -1040,7 +1184,7 @@ class SqliteMergedCommentsStore:
         cur = self.db.conn.execute(
             f"""
             SELECT payload_json
-            FROM {MERGED_TABLE_NAME}
+            FROM {self.table_name}
             WHERE user_id = ? AND merge_key LIKE ? AND created_at_bj >= ?
             ORDER BY created_at_bj DESC
             """,
@@ -1072,13 +1216,14 @@ class SqliteMergedCommentsStore:
 class SqliteMergedTalksStore:
     db: SqliteDb
     user_id: str
+    table_name: str = MERGED_TABLE_NAME
 
     def get_existing_obj(
         self, *, root_status_id: str, comment_id: str
     ) -> Optional[dict[str, Any]]:
         merge_key = f"{MERGE_KEY_TALK_PREFIX}{str(root_status_id)}:{str(comment_id)}"
         row = self.db.conn.execute(
-            f"SELECT payload_json FROM {MERGED_TABLE_NAME} WHERE merge_key = ? AND user_id = ?",
+            f"SELECT payload_json FROM {self.table_name} WHERE merge_key = ? AND user_id = ?",
             (str(merge_key), str(self.user_id)),
         ).fetchone()
         if not row:
@@ -1097,7 +1242,7 @@ class SqliteMergedTalksStore:
     ) -> Optional[dict[str, Any]]:
         merge_key = f"{MERGE_KEY_TALK_PREFIX}{str(root_status_id)}:{str(comment_id)}"
         row = self.db.conn.execute(
-            f"SELECT payload_json FROM {MERGED_TABLE_NAME} WHERE merge_key = ? AND user_id = ?",
+            f"SELECT payload_json FROM {self.table_name} WHERE merge_key = ? AND user_id = ?",
             (str(merge_key), str(self.user_id)),
         ).fetchone()
         if not row:
@@ -1182,7 +1327,7 @@ class SqliteMergedTalksStore:
         root_status_url = f"{BASE_URL}/status/{str(root_status_id).strip()}"
         try:
             row = self.db.conn.execute(
-                f"SELECT payload_json FROM {MERGED_TABLE_NAME} WHERE merge_key = ? AND user_id = ?",
+                f"SELECT payload_json FROM {self.table_name} WHERE merge_key = ? AND user_id = ?",
                 (str(comment_merge_key), str(user_id)),
             ).fetchone()
             if row:
@@ -1209,7 +1354,7 @@ class SqliteMergedTalksStore:
         )
         self.db.conn.execute(
             f"""
-            INSERT INTO {MERGED_TABLE_NAME}(
+            INSERT INTO {self.table_name}(
               merge_key, user_id, username, created_at_bj, fetched_at_bj, text, context_json, payload_json
             ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(merge_key) DO UPDATE SET
@@ -1234,7 +1379,7 @@ class SqliteMergedTalksStore:
         # with the same chain text (so comments do not appear "without context").
         try:
             self.db.conn.execute(
-                f"UPDATE {MERGED_TABLE_NAME} SET text = ? WHERE merge_key = ? AND user_id = ?",
+                f"UPDATE {self.table_name} SET text = ? WHERE merge_key = ? AND user_id = ?",
                 (str(text or ""), str(comment_merge_key), str(user_id)),
             )
         except Exception:

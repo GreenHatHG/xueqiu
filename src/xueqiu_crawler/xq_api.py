@@ -15,6 +15,7 @@ from .constants import (
     USER_COMMENTS_PAGE_SIZE,
 )
 from .rate_limit import RateLimiter
+from .text_sanitize import sanitize_xueqiu_text
 
 
 class BlockedError(RuntimeError):
@@ -35,6 +36,8 @@ class ChallengeRequiredError(BlockedError):
 DETAIL_PAGE_INITIAL_WAIT_MS = 1200
 DETAIL_WAF_SETTLE_TIMEOUT_SEC = 8.0
 DETAIL_WAF_SETTLE_POLL_SEC = 1.0
+
+STATUS_SHOW_JSON_PATH = "/statuses/show.json"
 
 
 def _looks_like_html(text: str) -> bool:
@@ -67,6 +70,57 @@ def _looks_like_waf_challenge(text: str) -> bool:
         "日志id",
     ]
     return any(m in lower or m in head for m in markers)
+
+
+def _extract_status_obj_from_show_payload(obj: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(obj, dict):
+        return None
+    # Common error shapes:
+    # - {"error_code": "...", "error_description": "..."}
+    if str(obj.get("error_code") or "").strip():
+        return None
+    if str(obj.get("error_description") or "").strip():
+        return None
+
+    if obj.get("id") is not None or obj.get("status_id") is not None:
+        return obj
+    for key in ("status", "data", "item", "result"):
+        inner = obj.get(key)
+        if isinstance(inner, dict) and (
+            inner.get("id") is not None or inner.get("status_id") is not None
+        ):
+            return inner
+    return None
+
+
+def _status_display_line_from_status_obj(status_obj: dict[str, Any]) -> str:
+    raw_text = status_obj.get("text") or status_obj.get("description")
+    text = sanitize_xueqiu_text(raw_text) or ""
+    text = str(text).strip()
+    if not text:
+        return ""
+
+    author = ""
+    user_obj = status_obj.get("user")
+    if isinstance(user_obj, dict):
+        for key in ("screen_name", "screenName", "name", "nickname"):
+            val = user_obj.get(key)
+            if val is None:
+                continue
+            s = str(val).strip()
+            if s:
+                author = s
+                break
+        if not author:
+            uid = user_obj.get("id") or user_obj.get("user_id") or user_obj.get("uid")
+            if uid not in (None, "", 0, "0"):
+                author = str(uid).strip()
+    if not author:
+        uid = status_obj.get("user_id") or status_obj.get("uid")
+        if uid not in (None, "", 0, "0"):
+            author = str(uid).strip()
+
+    return f"{author}：{text}" if author else text
 
 
 @dataclass
@@ -436,6 +490,65 @@ class XueqiuApi:
                 return line, final_url, page_html, page_title
         return line, final_url, page_html, page_title
 
+    def _fetch_status_display_line_via_show_json(
+        self,
+        status_id: str,
+        *,
+        referrer: str,
+        debug: Optional[dict[str, Any]] = None,
+    ) -> tuple[Optional[str], Optional[str]]:
+        sid = str(status_id or "").strip()
+        if not sid:
+            return None, "状态ID为空，没法补抓"
+
+        url = self.build_url(STATUS_SHOW_JSON_PATH, {"id": sid})
+        if debug is not None:
+            debug["show_json_url"] = str(url)
+
+        try:
+            obj = self._fetch_json_with_retry(
+                url,
+                referrer=str(referrer or "").strip() or None,
+                request_label=f"status-show id={sid}",
+            )
+        except ChallengeRequiredError as exc:
+            if debug is not None:
+                debug["show_json_error"] = {
+                    "issue_code": "waf_challenge",
+                    "url": str(exc.url or ""),
+                    "final_url": str(exc.final_url or ""),
+                    "status": int(exc.status),
+                    "text_head": str(exc.text_head or ""),
+                }
+            return None, "遇到风控验证页"
+        except BlockedError as exc:
+            if debug is not None:
+                debug["show_json_error"] = {"issue_code": "blocked", "error": str(exc)}
+            return None, f"接口被拦了：{exc}"
+        except Exception as exc:
+            if debug is not None:
+                debug["show_json_error"] = {"issue_code": "error", "error": str(exc)}
+            return None, f"接口请求失败：{exc}"
+
+        status_obj = _extract_status_obj_from_show_payload(obj)
+        if status_obj is None:
+            if debug is not None:
+                debug["show_json_error"] = {
+                    "issue_code": "bad_payload",
+                    "payload_type": type(obj).__name__,
+                }
+            return None, "接口回包没 status"
+
+        line = _status_display_line_from_status_obj(status_obj)
+        if not line:
+            if debug is not None:
+                debug["show_json_error"] = {"issue_code": "empty_text"}
+            return None, "接口回包没正文"
+
+        if debug is not None:
+            debug["show_json_success"] = True
+        return line, None
+
     def fetch_status_display_line(
         self,
         status_id: str,
@@ -443,6 +556,7 @@ class XueqiuApi:
         source_status_url: Optional[str] = None,
         status_url: Optional[str] = None,
         status_user_id: Optional[str] = None,
+        debug: Optional[dict[str, Any]] = None,
     ) -> tuple[Optional[str], Optional[str]]:
         """
         Open a status detail page and extract a readable "author: text" line.
@@ -462,10 +576,14 @@ class XueqiuApi:
             f"{BASE_URL}/{str(status_user_id).strip()}/{sid}"
             if str(status_user_id or "").strip()
             else "",
-            f"{BASE_URL}/status/{sid}",
         ):
             if candidate and candidate not in candidate_urls:
                 candidate_urls.append(candidate)
+
+        if debug is not None:
+            debug.clear()
+            debug["candidate_urls"] = list(candidate_urls)
+            debug["attempts"] = []
 
         last_reason = "页面没拿到正文"
         for url in candidate_urls:
@@ -494,6 +612,8 @@ class XueqiuApi:
                     )
                 )
                 if line:
+                    if debug is not None:
+                        debug["success_url"] = str(final_url or url)
                     return line, None
 
                 issue_code = "empty_page"
@@ -504,7 +624,10 @@ class XueqiuApi:
                     or "没有找到这条讨论" in page_html
                 ):
                     issue_code = "not_found"
-                    issue_reason = "帖子页 404，可能原帖没了"
+                    issue_reason = (
+                        "帖子页 404，可能原帖没了"
+                        f" url={str(url).strip()} final_url={str(final_url or '').strip()}"
+                    )
                 elif self._looks_like_challenge_url(
                     final_url
                 ) or _looks_like_waf_challenge(page_html):
@@ -517,6 +640,20 @@ class XueqiuApi:
                     issue_reason = f"页面打开了，但没抠到正文（status={status}）"
 
                 last_reason = issue_reason
+                if debug is not None:
+                    attempts = debug.get("attempts")
+                    if isinstance(attempts, list):
+                        attempts.append(
+                            {
+                                "url": str(url),
+                                "attempt": int(attempt + 1),
+                                "status": int(status),
+                                "final_url": str(final_url or ""),
+                                "page_title": str(page_title or ""),
+                                "issue_code": str(issue_code),
+                                "issue_reason": str(issue_reason),
+                            }
+                        )
                 if issue_code == "waf_challenge":
                     return None, issue_reason
                 if issue_code != "not_found" and attempt < self._cfg.max_retries:
@@ -528,6 +665,18 @@ class XueqiuApi:
                     backoff *= 2
                     continue
                 break
+
+        # Fallback: if page parsing failed, try JSON show endpoint.
+        json_referrer = candidate_urls[0] if candidate_urls else BASE_URL
+        json_line, json_reason = self._fetch_status_display_line_via_show_json(
+            sid, referrer=json_referrer, debug=debug
+        )
+        if json_line:
+            if debug is not None:
+                debug["success_url"] = str(debug.get("show_json_url") or "")
+            return json_line, None
+        if json_reason and ("风控" in str(json_reason) or "验证" in str(json_reason)):
+            return None, json_reason
         return None, last_reason
 
     @staticmethod
@@ -822,7 +971,7 @@ class XueqiuApi:
             first_url,
             referrer=ref,
             retry_reason=lambda payload: self._describe_collection_payload_issue(
-                payload, list_key="comments", allow_empty=False
+                payload, list_key="comments", allow_empty=True
             ),
             request_label=f"talks root={root_status_id} comment={comment_id} page=1",
         )
@@ -919,7 +1068,7 @@ class XueqiuApi:
             first_url,
             referrer=ref,
             retry_reason=lambda payload: self._describe_collection_payload_issue(
-                payload, list_key="comments", allow_empty=False
+                payload, list_key="comments", allow_empty=True
             ),
             request_label=f"talks root={root_status_id} comment={comment_id} page=1",
         )

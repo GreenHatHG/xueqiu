@@ -33,13 +33,15 @@ from .constants import (
 )
 from .storage import (
     MERGE_KEY_COMMENT_PREFIX,
+    RAW_TABLE_NAME,
+    SqliteCrawlCheckpointStore,
     SqliteCrawlProgressStore,
     SqliteDb,
     SqliteMergedCommentsStore,
     SqliteMergedStatusesStore,
     SqliteMergedTalksStore,
     SqliteTalksProgressStore,
-    collapse_user_records_to_entries,
+    rebuild_user_entries_from_raw_records,
 )
 from .text_sanitize import sanitize_xueqiu_text
 from .xq_api import (
@@ -122,9 +124,9 @@ def _user_has_entry_rows(*, db: SqliteDb, user_id: str) -> bool:
 
 def _user_has_raw_rows(*, db: SqliteDb, user_id: str) -> bool:
     row = db.conn.execute(
-        """
+        f"""
         SELECT 1
-        FROM merged_records
+        FROM {RAW_TABLE_NAME}
         WHERE user_id = ?
           AND (
             merge_key LIKE 'status:%'
@@ -136,6 +138,52 @@ def _user_has_raw_rows(*, db: SqliteDb, user_id: str) -> bool:
         (str(user_id),),
     ).fetchone()
     return bool(row)
+
+
+def _max_raw_created_at_bj_iso(*, db: SqliteDb, user_id: str) -> Optional[str]:
+    row = db.conn.execute(
+        f"""
+        SELECT MAX(created_at_bj) AS max_created_at_bj
+        FROM {RAW_TABLE_NAME}
+        WHERE user_id = ?
+          AND created_at_bj IS NOT NULL
+          AND created_at_bj != ''
+        """,
+        (str(user_id),),
+    ).fetchone()
+    if not row:
+        return None
+    value = row["max_created_at_bj"]
+    if value in (None, ""):
+        return None
+    return str(value).strip()
+
+
+def _resolve_incremental_since_bj(
+    *,
+    args: argparse.Namespace,
+    db: SqliteDb,
+    user_id: str,
+    tz_name: str,
+) -> dt.datetime:
+    checkpoint_store = SqliteCrawlCheckpointStore(db=db)
+    checkpoint = checkpoint_store.get(user_id=str(user_id))
+    if checkpoint:
+        return _parse_since_to_beijing(
+            str(checkpoint.get("checkpoint_bj_iso") or ""), tz_name=tz_name
+        )
+
+    raw_max_bj_iso = _max_raw_created_at_bj_iso(db=db, user_id=str(user_id))
+    if raw_max_bj_iso:
+        return _parse_since_to_beijing(raw_max_bj_iso, tz_name=tz_name)
+
+    if args.since:
+        return _parse_since_to_beijing(args.since, tz_name=tz_name)
+
+    raise ValueError(
+        f"--incremental mode requires an existing checkpoint or raw_records history for user {user_id}. "
+        "For the first run of a new user, please provide --since."
+    )
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -161,8 +209,17 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help=(
             "截止时间（本地时区日期 YYYY-MM-DD 或 ISO 8601 时间）。"
-            "core 模式必填：抓取 >= since 的内容，遇到更早内容则停止。"
+            "非增量 core 模式必填：抓取 >= since 的内容，遇到更早内容则停止。"
             "incremental_http 模式可选：若不提供则不做时间过滤（仍然只抓一页）。"
+            "When using --incremental, --since is only needed for the first run of a new user."
+        ),
+    )
+    p.add_argument(
+        "--incremental",
+        action="store_true",
+        help=(
+            "Enable incremental crawling: use per-user checkpoint (watermark) to fetch only newly published content. "
+            "De-dup is handled by SQLite merge_key uniqueness."
         ),
     )
     p.add_argument(
@@ -1620,15 +1677,22 @@ def _run_single_user(
     session,
     user_id: str,
 ) -> int:
+    incremental = bool(getattr(args, "incremental", False))
     api_cfg = ApiConfig(
         min_delay_sec=args.min_delay,
         jitter_sec=args.jitter,
         max_retries=args.max_retries,
         max_consecutive_blocks=args.max_consecutive_blocks,
     )
-    timeline_store = SqliteMergedStatusesStore(db=db, user_id=str(user_id))
-    comment_store = SqliteMergedCommentsStore(db=db, user_id=str(user_id))
-    talks_store = SqliteMergedTalksStore(db=db, user_id=str(user_id))
+    timeline_store = SqliteMergedStatusesStore(
+        db=db, user_id=str(user_id), table_name=RAW_TABLE_NAME
+    )
+    comment_store = SqliteMergedCommentsStore(
+        db=db, user_id=str(user_id), table_name=RAW_TABLE_NAME
+    )
+    talks_store = SqliteMergedTalksStore(
+        db=db, user_id=str(user_id), table_name=RAW_TABLE_NAME
+    )
     talks_progress_store = SqliteTalksProgressStore(db=db, user_id=str(user_id))
     crawl_progress_store = SqliteCrawlProgressStore(db=db, user_id=str(user_id))
 
@@ -1647,7 +1711,7 @@ def _run_single_user(
 
     def fetch_detail_with_headless_worker(
         *, status_id: str, source_status_url: str, status_url: str, status_user_id: str
-    ) -> tuple[Optional[str], Optional[str]]:
+    ) -> tuple[Optional[str], Optional[str], dict[str, Any]]:
         command = [
             sys.executable,
             "-m",
@@ -1695,14 +1759,16 @@ def _run_single_user(
                     file=sys.stderr,
                 )
             if not stdout_text:
-                return None, "无头补抓没有返回结果"
+                return None, "无头补抓没有返回结果", {}
             try:
                 payload = json.loads(stdout_text)
             except Exception:
-                return None, f"无头补抓结果解析失败：{stdout_text}"
+                return None, f"无头补抓结果解析失败：{stdout_text}", {}
 
             line = payload.get("line")
             failure_reason = payload.get("failure_reason")
+            debug = payload.get("debug")
+            debug_dict: dict[str, Any] = debug if isinstance(debug, dict) else {}
             stealth_mode = str(payload.get("stealth_mode") or "").strip()
             if stealth_mode:
                 print(
@@ -1710,15 +1776,63 @@ def _run_single_user(
                     file=sys.stderr,
                 )
             if proc.returncode != 0 and not line and not failure_reason:
-                return None, "无头补抓子进程失败"
+                return None, "无头补抓子进程失败", debug_dict
             return (
                 str(line).strip() if line not in (None, "") else None,
                 str(failure_reason).strip()
                 if failure_reason not in (None, "")
                 else None,
+                debug_dict,
             )
         except Exception as exc:
-            return None, f"无头补抓异常：{exc}"
+            return None, f"无头补抓异常：{exc}", {}
+
+    def _short_debug_value(value: Any, max_len: int = 180) -> str:
+        text = str(value or "").replace("\n", " ").strip()
+        if len(text) <= max_len:
+            return text
+        return f"{text[:max_len]}..."
+
+    def _log_detail_debug(*, status_id: str, debug: dict[str, Any]) -> None:
+        candidates = debug.get("candidate_urls")
+        attempts = debug.get("attempts")
+        if not isinstance(candidates, list):
+            candidates = []
+        if not isinstance(attempts, list):
+            attempts = []
+
+        last_by_url: dict[str, dict[str, Any]] = {}
+        seen_order: list[str] = []
+        for item in attempts:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            if url not in last_by_url:
+                seen_order.append(url)
+            last_by_url[url] = item
+
+        ordered_urls = [
+            str(url).strip() for url in candidates if str(url or "").strip()
+        ] or seen_order
+        if not ordered_urls:
+            return
+
+        print(
+            f"[detail] Headless detail fetch attempted URLs status_id={status_id}:",
+            file=sys.stderr,
+        )
+        for url in ordered_urls:
+            item = last_by_url.get(url, {})
+            status = item.get("status")
+            final_url = item.get("final_url")
+            page_title = item.get("page_title")
+            issue_reason = item.get("issue_reason") or item.get("issue_code") or ""
+            print(
+                f"[detail]  url={_short_debug_value(url)} status={status} final_url={_short_debug_value(final_url)} title={_short_debug_value(page_title)} reason={_short_debug_value(issue_reason)}",
+                file=sys.stderr,
+            )
 
     def resolve_status_line(
         status_id: str,
@@ -1738,7 +1852,7 @@ def _run_single_user(
         if cache_key in detail_status_line_cache:
             return detail_status_line_cache[cache_key]
         print(f"[detail] 尝试补抓原帖全文 status_id={sid}", file=sys.stderr)
-        line, failure_reason = fetch_detail_with_headless_worker(
+        line, failure_reason, debug = fetch_detail_with_headless_worker(
             status_id=sid,
             source_status_url=str(source_status_url or "").strip(),
             status_url=str(status_url or "").strip(),
@@ -1751,6 +1865,8 @@ def _run_single_user(
                 f"[detail] 原帖全文补抓失败 status_id={sid}，原因：{failure_reason or '页面没拿到正文'}",
                 file=sys.stderr,
             )
+            if debug:
+                _log_detail_debug(status_id=sid, debug=debug)
         detail_status_line_cache[cache_key] = line
         return line
 
@@ -1767,40 +1883,67 @@ def _run_single_user(
         print("当前仅支持 core 模式。", file=sys.stderr)
         return 2
 
+    checkpoint_store: Optional[SqliteCrawlCheckpointStore] = None
+    checkpoint_existed = False
+    if incremental:
+        checkpoint_store = SqliteCrawlCheckpointStore(db=db)
+        checkpoint_existed = checkpoint_store.get(user_id=str(user_id)) is not None
+
     tz_name = str(args.tz)
     try:
-        since_bj = _parse_since_to_beijing(args.since, tz_name=tz_name)
+        if incremental:
+            since_bj = _resolve_incremental_since_bj(
+                args=args, db=db, user_id=str(user_id), tz_name=tz_name
+            )
+        else:
+            since_bj = _parse_since_to_beijing(args.since, tz_name=tz_name)
     except Exception as e:
         print(str(e), file=sys.stderr)
         return 2
     since_bj_iso = since_bj.replace(microsecond=0).isoformat()
+    if incremental and checkpoint_store is not None and (not checkpoint_existed):
+        checkpoint_store.upsert(
+            user_id=str(user_id),
+            checkpoint_bj_iso=str(since_bj_iso),
+            detail={
+                "seeded": True,
+                "seed_checkpoint_bj_iso": str(since_bj_iso),
+                "seed_reason": "missing_checkpoint",
+            },
+        )
 
     # core 模式默认尽量把“查看对话”也补齐；如果你只要主干数据可用 --no-talks 关闭。
     want_talks = bool(args.with_talks) or (not bool(args.no_talks))
 
-    if crawl_progress_store.is_completed(
-        since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_FINALIZE
-    ):
-        print(f"{user_log_prefix} 上次已经完整跑完，这次直接跳过。", file=sys.stderr)
-        return 0
-    if _user_has_entry_rows(db=db, user_id=str(user_id)) and not _user_has_raw_rows(
-        db=db, user_id=str(user_id)
-    ):
-        crawl_progress_store.mark_completed(
-            since_bj_iso=since_bj_iso,
-            stage=PROGRESS_STAGE_FINALIZE,
-            detail={"inferred_from_entries": True},
-        )
-        print(f"{user_log_prefix} 已发现完整结果，这次直接跳过。", file=sys.stderr)
-        return 0
+    if not incremental:
+        if crawl_progress_store.is_completed(
+            since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_FINALIZE
+        ):
+            print(
+                f"{user_log_prefix} 上次已经完整跑完，这次直接跳过。", file=sys.stderr
+            )
+            return 0
+        if _user_has_entry_rows(db=db, user_id=str(user_id)) and not _user_has_raw_rows(
+            db=db, user_id=str(user_id)
+        ):
+            crawl_progress_store.mark_completed(
+                since_bj_iso=since_bj_iso,
+                stage=PROGRESS_STAGE_FINALIZE,
+                detail={"inferred_from_entries": True},
+            )
+            print(f"{user_log_prefix} 已发现完整结果，这次直接跳过。", file=sys.stderr)
+            return 0
 
     had_blocked = False
     wrote_statuses = 0
     wrote_comments = 0
     wrote_talks = 0
+    timeline_stage_ok = True
+    comments_stage_ok = True
+    talks_stage_ok = True
     limiter = RateLimiter(float(args.min_delay), float(args.jitter))
 
-    if crawl_progress_store.is_completed(
+    if (not incremental) and crawl_progress_store.is_completed(
         since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_TIMELINE
     ):
         print(f"{user_log_prefix} 时间线上次已经跑完，这次跳过。", file=sys.stderr)
@@ -1824,6 +1967,7 @@ def _run_single_user(
             stage_name=PROGRESS_STAGE_TIMELINE,
         )
         wrote_statuses = int(timeline_result.wrote)
+        timeline_stage_ok = bool(timeline_result.saw_any)
         if wrote_statuses:
             print(
                 f"{user_log_prefix} 时间线新增写入 {wrote_statuses} 条到 SQLite：{db_path}"
@@ -1833,8 +1977,13 @@ def _run_single_user(
                 f"{user_log_prefix} 未拦截到时间线 JSON，已降级保存 HTML 快照：{timeline_result.html_path}",
                 file=sys.stderr,
             )
+            if incremental:
+                print(
+                    f"{user_log_prefix} [incremental] Timeline JSON not intercepted; checkpoint will not advance.",
+                    file=sys.stderr,
+                )
 
-    if crawl_progress_store.is_completed(
+    if (not incremental) and crawl_progress_store.is_completed(
         since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_COMMENTS
     ):
         print(f"{user_log_prefix} 回复上次已经跑完，这次跳过。", file=sys.stderr)
@@ -1885,14 +2034,17 @@ def _run_single_user(
                     )
                 )
             except Exception as e2:
+                comments_stage_ok = False
                 had_blocked = True
                 wrote_comments, _comments_oldest, comments_pages = 0, None, 0
                 print(f"{user_log_prefix} 回复抓取被拦截：{e2}", file=sys.stderr)
         except BlockedError as e:
+            comments_stage_ok = False
             had_blocked = True
             wrote_comments, _comments_oldest, comments_pages = 0, None, 0
             print(f"{user_log_prefix} 回复接口当前不可用：{e}", file=sys.stderr)
         except Exception as e:
+            comments_stage_ok = False
             comments_fetch_error = e
             wrote_comments, _comments_oldest, comments_pages = 0, None, 0
         if wrote_comments:
@@ -1946,6 +2098,7 @@ def _run_single_user(
         )
         wrote_comments = int(comments_result.wrote)
         comments_pages = int(comments_result.captured_batches)
+        comments_stage_ok = bool(comments_result.saw_any)
         crawl_progress_store.mark_completed(
             since_bj_iso=since_bj_iso,
             stage=PROGRESS_STAGE_COMMENTS,
@@ -1966,9 +2119,18 @@ def _run_single_user(
                 f"{user_log_prefix} 未拦截到回复 JSON，已降级保存 HTML 快照：{comments_result.html_path}",
                 file=sys.stderr,
             )
+            if incremental:
+                print(
+                    f"{user_log_prefix} [incremental] Comments JSON not intercepted; checkpoint will not advance.",
+                    file=sys.stderr,
+                )
 
-    if want_talks and crawl_progress_store.is_completed(
-        since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_TALKS
+    if (
+        want_talks
+        and (not incremental)
+        and crawl_progress_store.is_completed(
+            since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_TALKS
+        )
     ):
         print(f"{user_log_prefix} 查看对话上次已经跑完，这次跳过。", file=sys.stderr)
     elif want_talks:
@@ -2010,12 +2172,15 @@ def _run_single_user(
                     stage=PROGRESS_STAGE_TALKS,
                 )
             except Exception as e2:
+                talks_stage_ok = False
                 had_blocked = True
                 print(f"{user_log_prefix} 查看对话抓取被拦截：{e2}", file=sys.stderr)
         except BlockedError as e:
+            talks_stage_ok = False
             had_blocked = True
             print(f"{user_log_prefix} 查看对话抓取被拦截：{e}", file=sys.stderr)
         except Exception as e:
+            talks_stage_ok = False
             had_blocked = True
             print(f"{user_log_prefix} 查看对话抓取失败：{e}", file=sys.stderr)
         if wrote_talks:
@@ -2029,25 +2194,63 @@ def _run_single_user(
             detail={"skipped": True},
         )
 
-    if not crawl_progress_store.is_completed(
-        since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_FINALIZE
-    ):
-        final_entries = collapse_user_records_to_entries(
-            db=db,
-            user_id=str(user_id),
-            resolve_status_line=resolve_status_line,
-        )
+    wrote_total = wrote_statuses + wrote_comments + wrote_talks
+    if incremental:
+        wrote_total = wrote_statuses + wrote_comments + wrote_talks
+        final_entries = 0
+        finalize_detail: dict[str, Any] = {
+            "skipped": True,
+            "no_new_raw_rows": True,
+            "wrote_raw_total": int(wrote_total),
+        }
+        if wrote_total > 0:
+            final_entries = rebuild_user_entries_from_raw_records(
+                db=db,
+                user_id=str(user_id),
+                resolve_status_line=resolve_status_line,
+            )
+            finalize_detail = {
+                "final_entries": int(final_entries),
+                "from_raw_records": True,
+                "wrote_raw_total": int(wrote_total),
+            }
+            if final_entries:
+                print(
+                    f"{user_log_prefix} 最终展示记录写入 {final_entries} 条到 SQLite：{db_path}"
+                )
         crawl_progress_store.mark_completed(
             since_bj_iso=since_bj_iso,
             stage=PROGRESS_STAGE_FINALIZE,
             current_index=1,
             total_count=1,
-            detail={"final_entries": int(final_entries)},
+            detail=finalize_detail,
         )
-        if final_entries:
-            print(
-                f"{user_log_prefix} 最终展示记录写入 {final_entries} 条到 SQLite：{db_path}"
+    else:
+        already_finalized = crawl_progress_store.is_completed(
+            since_bj_iso=since_bj_iso, stage=PROGRESS_STAGE_FINALIZE
+        )
+        should_finalize = wrote_total > 0 or (not already_finalized)
+        if should_finalize:
+            final_entries = rebuild_user_entries_from_raw_records(
+                db=db,
+                user_id=str(user_id),
+                resolve_status_line=resolve_status_line,
             )
+            crawl_progress_store.mark_completed(
+                since_bj_iso=since_bj_iso,
+                stage=PROGRESS_STAGE_FINALIZE,
+                current_index=1,
+                total_count=1,
+                detail={
+                    "final_entries": int(final_entries),
+                    "from_raw_records": True,
+                    "wrote_raw_total": int(wrote_total),
+                },
+            )
+            if final_entries:
+                print(
+                    f"{user_log_prefix} 最终展示记录写入 {final_entries} 条到 SQLite：{db_path}"
+                )
 
     if had_blocked and (wrote_statuses + wrote_comments + wrote_talks == 0):
         print(
@@ -2056,6 +2259,39 @@ def _run_single_user(
             file=sys.stderr,
         )
         return 2
+
+    if incremental:
+        checkpoint_blockers: list[str] = []
+        if had_blocked:
+            checkpoint_blockers.append("blocked")
+        if not timeline_stage_ok:
+            checkpoint_blockers.append("timeline_no_json")
+        if not comments_stage_ok:
+            checkpoint_blockers.append("comments_failed")
+        if want_talks and (not talks_stage_ok):
+            checkpoint_blockers.append("talks_failed")
+
+        should_advance_checkpoint = not checkpoint_blockers
+        if should_advance_checkpoint:
+            checkpoint_bj_iso = _max_raw_created_at_bj_iso(db=db, user_id=str(user_id))
+            if checkpoint_bj_iso:
+                assert checkpoint_store is not None
+                checkpoint_store.upsert(
+                    user_id=str(user_id),
+                    checkpoint_bj_iso=checkpoint_bj_iso,
+                    detail={
+                        "since_bj_iso": str(since_bj_iso),
+                        "wrote_raw_total": int(
+                            wrote_statuses + wrote_comments + wrote_talks
+                        ),
+                        "advanced": True,
+                    },
+                )
+        else:
+            print(
+                f"{user_log_prefix} [incremental] Checkpoint not advanced (reasons: {', '.join(checkpoint_blockers)}).",
+                file=sys.stderr,
+            )
     return 0
 
 
@@ -2155,10 +2391,11 @@ def _crawl_comments_one_page_via_http_api(
         if merge_keys:
             placeholders = ",".join(["?"] * len(merge_keys))
             try:
+                table_name = str(getattr(store, "table_name", "merged_records"))
                 cur = store.db.conn.execute(
                     f"""
                     SELECT merge_key
-                    FROM merged_records
+                    FROM {table_name}
                     WHERE merge_key IN ({placeholders})
                     """,
                     merge_keys,
@@ -2316,9 +2553,15 @@ def _run_single_user_incremental_http(
         max_retries=args.max_retries,
         max_consecutive_blocks=args.max_consecutive_blocks,
     )
-    timeline_store = SqliteMergedStatusesStore(db=db, user_id=str(user_id))
-    comment_store = SqliteMergedCommentsStore(db=db, user_id=str(user_id))
-    talks_store = SqliteMergedTalksStore(db=db, user_id=str(user_id))
+    timeline_store = SqliteMergedStatusesStore(
+        db=db, user_id=str(user_id), table_name=RAW_TABLE_NAME
+    )
+    comment_store = SqliteMergedCommentsStore(
+        db=db, user_id=str(user_id), table_name=RAW_TABLE_NAME
+    )
+    talks_store = SqliteMergedTalksStore(
+        db=db, user_id=str(user_id), table_name=RAW_TABLE_NAME
+    )
 
     seen_status_ids: set[str] = set()
     seen_comment_ids: set[str] = set()
@@ -2452,7 +2695,7 @@ def _run_single_user_incremental_http(
             detail_cache[sid] = line
             return line
 
-        final_entries = collapse_user_records_to_entries(
+        final_entries = rebuild_user_entries_from_raw_records(
             db=db,
             user_id=str(user_id),
             resolve_status_line=resolve_status_line,
@@ -2495,31 +2738,27 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     db_path = _resolve_db_path(args=args, out_dir=out_dir)
     cooldown_sec = max(0.0, float(args.user_cooldown_sec))
-    if args.mode == "core" and not str(args.since or "").strip():
-        print(
-            "core 模式必须提供 --since（YYYY-MM-DD 或 ISO 8601 时间）", file=sys.stderr
-        )
-        return 2
-
-    resume_since_bj: dt.datetime
-    if str(args.since or "").strip():
-        try:
-            resume_since_bj = _parse_since_to_beijing(args.since, tz_name=str(args.tz))
-        except Exception as e:
-            print(str(e), file=sys.stderr)
-            return 2
-    else:
-        # For incremental_http: `--since` is optional. Use a very old timestamp
-        # so no records on the fetched first page are filtered out.
-        resume_since_bj = dt.datetime(1970, 1, 1, tzinfo=BEIJING_TIMEZONE)
-
-    resume_since_bj_iso = resume_since_bj.replace(microsecond=0).isoformat()
 
     print(
         f"本次共 {len(target_user_ids)} 个用户，统一写入 SQLite：{db_path}",
         file=sys.stderr,
     )
+
     if args.mode == "incremental_http":
+        resume_since_bj: dt.datetime
+        if str(args.since or "").strip():
+            try:
+                resume_since_bj = _parse_since_to_beijing(
+                    args.since, tz_name=str(args.tz)
+                )
+            except Exception as e:
+                print(str(e), file=sys.stderr)
+                return 2
+        else:
+            # For incremental_http: `--since` is optional. Use a very old timestamp
+            # so no records on the fetched first page are filtered out.
+            resume_since_bj = dt.datetime(1970, 1, 1, tzinfo=BEIJING_TIMEZONE)
+
         with SqliteDb(db_path) as db:
             total = len(target_user_ids)
             for index, user_id in enumerate(target_user_ids, start=1):
@@ -2550,6 +2789,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                     time.sleep(cooldown_sec)
         return 0
 
+    incremental = bool(getattr(args, "incremental", False))
+    resume_since_bj_iso = ""
+    if (not incremental) and (not str(args.since or "").strip()):
+        print(
+            "core 模式必须提供 --since（YYYY-MM-DD 或 ISO 8601 时间）", file=sys.stderr
+        )
+        return 2
+    if not incremental:
+        try:
+            resume_since_bj = _parse_since_to_beijing(args.since, tz_name=str(args.tz))
+        except Exception as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        resume_since_bj_iso = resume_since_bj.replace(microsecond=0).isoformat()
+
     base_user_data_dir = Path(args.user_data_dir)
     browser_profiles_root = _build_browser_profiles_root(out_dir)
 
@@ -2577,28 +2831,31 @@ def main(argv: Optional[list[str]] = None) -> int:
     with SqliteDb(db_path) as db:
         total = len(target_user_ids)
         for index, user_id in enumerate(target_user_ids, start=1):
-            crawl_progress_store = SqliteCrawlProgressStore(db=db, user_id=str(user_id))
-            if crawl_progress_store.is_completed(
-                since_bj_iso=resume_since_bj_iso, stage=PROGRESS_STAGE_FINALIZE
-            ):
-                print(
-                    f"开始抓取用户 {index}/{total}：{user_id}（上次已经跑完，这次跳过）",
-                    file=sys.stderr,
+            if not incremental:
+                crawl_progress_store = SqliteCrawlProgressStore(
+                    db=db, user_id=str(user_id)
                 )
-                continue
-            if _user_has_entry_rows(
-                db=db, user_id=str(user_id)
-            ) and not _user_has_raw_rows(db=db, user_id=str(user_id)):
-                crawl_progress_store.mark_completed(
-                    since_bj_iso=resume_since_bj_iso,
-                    stage=PROGRESS_STAGE_FINALIZE,
-                    detail={"inferred_from_entries": True},
-                )
-                print(
-                    f"开始抓取用户 {index}/{total}：{user_id}（已发现完整结果，这次跳过）",
-                    file=sys.stderr,
-                )
-                continue
+                if crawl_progress_store.is_completed(
+                    since_bj_iso=resume_since_bj_iso, stage=PROGRESS_STAGE_FINALIZE
+                ):
+                    print(
+                        f"开始抓取用户 {index}/{total}：{user_id}（上次已经跑完，这次跳过）",
+                        file=sys.stderr,
+                    )
+                    continue
+                if _user_has_entry_rows(
+                    db=db, user_id=str(user_id)
+                ) and not _user_has_raw_rows(db=db, user_id=str(user_id)):
+                    crawl_progress_store.mark_completed(
+                        since_bj_iso=resume_since_bj_iso,
+                        stage=PROGRESS_STAGE_FINALIZE,
+                        detail={"inferred_from_entries": True},
+                    )
+                    print(
+                        f"开始抓取用户 {index}/{total}：{user_id}（已发现完整结果，这次跳过）",
+                        file=sys.stderr,
+                    )
+                    continue
             user_profile_dir = _build_user_browser_profile_dir(
                 profiles_root=browser_profiles_root,
                 index=index,
