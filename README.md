@@ -62,6 +62,32 @@
 
 - 最小可用：
   `uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06`
+- Browserless incremental (HTTP, no Playwright/Chrome):
+  - Requires `XUEQIU_COOKIE` (full Cookie header value)
+  - Fetches only **1 page** for timeline + comments each run, but still backfills talks/detail best-effort
+  - Example:
+    - `export XUEQIU_COOKIE='xq_a_token=...; u=...; ...'`
+    - `uv run xq-crawl --mode incremental_http --user-list-file data/user_ids.txt`
+  - Note: `--since` is required only for `--mode core` (browser backfill).
+- RSS 服务（按 user_id 实时出前几条）：
+  - 先说一句：这个服务会用 SQLite 当缓存；TTL 内只读库，TTL 过了会先跑一次增量抓取再返回 RSS。
+  - 环境变量：
+    - `XUEQIU_COOKIE`：必须（抓取用；TTL 内如果不触发抓取，可以暂时不需要）
+    - `XQ_RSS_KEY`：必须（访问 RSS 时要带 `key`）
+    - `XQ_RSS_TTL_SEC`：缓存秒数（默认 300）
+    - `XQ_RSS_DB_PATH`：SQLite 路径（默认 `data/xueqiu_batch.sqlite3`）
+  - 本地跑：
+    - `export XUEQIU_COOKIE='xq_a_token=...; u=...; ...'`
+    - `export XQ_RSS_KEY='your_key'`
+    - `export XQ_RSS_TTL_SEC=300`
+    - `uv run xq-rss --host 0.0.0.0 --port 8000`
+    - 打开：`http://127.0.0.1:8000/u/123456789?limit=20&key=your_key`
+  - Docker 跑（不安装 Playwright/浏览器依赖）：
+    - 构建：`docker build -f docker/xq-rss/Dockerfile -t xq-rss .`
+    - 运行（把 SQLite 挂到 volume，重启不丢）：
+      - `docker run --rm -p 8000:8000 -e XUEQIU_COOKIE='...' -e XQ_RSS_KEY='your_key' -e XQ_RSS_TTL_SEC=300 -v xq_data:/app/data xq-rss`
+  - 失败行为：
+    - TTL 过期且抓取失败 → 直接返回 HTTP 502（方便监控）
 - 指定统一数据库：
   `uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06 --db data/my_batch.sqlite3`
 - 调大两个用户之间的等待：
