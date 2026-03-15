@@ -29,6 +29,7 @@ from .constants import (
     DEFAULT_MIN_DELAY_SEC,
     DEFAULT_OUTPUT_DIR,
 )
+from .sqlite_maintenance import maybe_cleanup_old_data
 from .storage import MERGED_TABLE_NAME, SqliteCrawlProgressStore, SqliteDb
 
 
@@ -53,6 +54,7 @@ BEIJING_TZ = ZoneInfo(BEIJING_TIMEZONE_NAME)
 
 _USER_LOCKS: dict[str, threading.Lock] = {}
 _USER_LOCKS_GUARD = threading.Lock()
+_DB_MAINTENANCE_LOCK = threading.Lock()
 
 DEFAULT_ROOT_TEXT = "ok\nTry: /u/{user_id}?limit=20&key=YOUR_KEY\n"
 
@@ -393,6 +395,26 @@ def user_rss(user_id: str, request: Request) -> Response:
     with lock:
         try:
             with SqliteDb(db_path) as db:
+                with _DB_MAINTENANCE_LOCK:
+                    try:
+                        result = maybe_cleanup_old_data(db.conn)
+                        if bool(result.get("ran")):
+                            print(
+                                "[db] cleanup ok "
+                                f"days={int(result.get('retention_days') or 0)} "
+                                f"deleted_raw={int(result.get('deleted_raw') or 0)} "
+                                f"deleted_merged={int(result.get('deleted_merged') or 0)} "
+                                f"cutoff={str(result.get('cutoff_bj_iso') or '')}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                    except Exception as e:
+                        print(
+                            f"[db] cleanup failed: {e}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+
                 progress_store = SqliteCrawlProgressStore(db=db, user_id=str(uid))
                 progress = progress_store.get(
                     since_bj_iso=RSS_PROGRESS_SINCE_BJ_ISO, stage=RSS_PROGRESS_STAGE
