@@ -64,6 +64,8 @@
   `uv run xq-crawl --user-list-file data/user_ids.txt --since 2026-03-06`
 - 增量更新（抓取同一批用户的最新内容；首次跑新用户仍需要 --since 初始化）：
   `uv run xq-crawl --user-list-file data/user_ids.txt --incremental`
+- 从某个用户开始继续跑（比如上次跑到中途失败了）：
+  `uv run xq-crawl --user-list-file data/user_ids.txt --incremental --start-from-user 2437174515`
 - Browserless incremental (HTTP, no Playwright/Chrome):
   - Requires `XUEQIU_COOKIE` (full Cookie header value)
   - Fetches only **1 page** for timeline + comments each run, but still backfills talks/detail best-effort

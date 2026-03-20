@@ -61,6 +61,7 @@ UI_INTERCEPT_MAX_IDLE_ROUNDS = 6
 UI_INTERCEPT_ROUNDS_PER_BATCH = 30
 UI_INTERCEPT_PAGE_TURN_TIMEOUT_SEC = 8.0
 UI_INTERCEPT_PAGE_TURN_SETTLE_SEC = 2.0
+UI_INTERCEPT_MAX_CONSECUTIVE_EMPTY_TIMELINE_BATCHES = 3
 LOGIN_STATE_CHECK_INTERVAL_SEC = 4.0
 LOGIN_STATE_CONFIRM_SETTLE_SEC = 2.0
 BASE_PROFILE_COPY_SETTLE_SEC = 2.0
@@ -193,6 +194,14 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         required=True,
         help="用户列表文件路径（UTF-8 文本；每行一个用户ID，空行与 # 注释行会忽略）",
+    )
+    p.add_argument(
+        "--start-from-user",
+        default="",
+        help=(
+            "从指定 user_id 开始跑（包含该用户）。"
+            "用于某个用户失败退出后，下次重跑不用从第一个用户慢慢走到它。"
+        ),
     )
     p.add_argument(
         "--mode",
@@ -997,12 +1006,19 @@ class _UiInterceptStats:
     wrote: int = 0
     captured_batches: int = 0
     consecutive_old_batches: int = 0
+    consecutive_empty_batches: int = 0
     saw_any: bool = False
     last_hit_ts: float = 0.0
     last_batch_oldest: Optional[dt.datetime] = None
 
     def should_stop(self) -> bool:
         if self.max_batches > 0 and self.captured_batches >= self.max_batches:
+            return True
+        if (
+            str(self.kind_name) == PROGRESS_STAGE_TIMELINE
+            and int(self.consecutive_empty_batches)
+            >= UI_INTERCEPT_MAX_CONSECUTIVE_EMPTY_TIMELINE_BATCHES
+        ):
             return True
         # If we've already observed sufficiently old batches a few times,
         # and no more new batches appear, the scroll loop will stop by idle logic.
@@ -1044,14 +1060,39 @@ def _make_ui_response_handler(stats: _UiInterceptStats):
         if not isinstance(obj, dict):
             return
 
-        stats.saw_any = True
-        stats.last_hit_ts = time.time()
-        stats.captured_batches += 1
-        page_num = _timeline_page_from_url(url)
-        if page_num > 0:
-            stats.current_page_number = int(page_num)
-
         records, batch_oldest = stats.extract_records(obj)
+        is_empty_batch = not bool(records)
+
+        stats.saw_any = True
+        stats.captured_batches += 1
+
+        if str(stats.kind_name) == PROGRESS_STAGE_TIMELINE:
+            if is_empty_batch:
+                stats.consecutive_empty_batches += 1
+            else:
+                stats.consecutive_empty_batches = 0
+
+            if (
+                int(stats.consecutive_empty_batches)
+                == UI_INTERCEPT_MAX_CONSECUTIVE_EMPTY_TIMELINE_BATCHES
+            ):
+                print(
+                    f"[{stats.kind_name}] 连续 {stats.consecutive_empty_batches} 批为空，停止继续翻页/滚动（可能已到末尾或被拦截）。",
+                    file=sys.stderr,
+                )
+
+            # Timeline empty batches are not treated as "effective progress" to avoid
+            # endless page turns when later pages always return empty lists.
+            if not is_empty_batch:
+                stats.last_hit_ts = time.time()
+                page_num = _timeline_page_from_url(url)
+                if page_num > 0:
+                    stats.current_page_number = int(page_num)
+        else:
+            stats.last_hit_ts = time.time()
+            page_num = _timeline_page_from_url(url)
+            if page_num > 0:
+                stats.current_page_number = int(page_num)
         batch_newest: Optional[dt.datetime] = None
         to_write: list[dict[str, Any]] = []
         for raw in records:
@@ -1077,38 +1118,47 @@ def _make_ui_response_handler(stats: _UiInterceptStats):
         if to_write:
             stats.wrote += stats.store.append_many(to_write)
 
-        stats.last_batch_oldest = batch_oldest
+        if batch_oldest is not None:
+            stats.last_batch_oldest = batch_oldest
         if stats.progress_store is not None and stats.since_bj_iso and stats.stage_name:
-            progress_index = int(stats.captured_batches)
-            progress_cursor = str(stats.captured_batches)
-            if (
-                str(stats.stage_name) == PROGRESS_STAGE_TIMELINE
-                and int(stats.current_page_number or 0) > 0
-            ):
-                progress_index = int(stats.current_page_number)
-                progress_cursor = str(stats.current_page_number)
-            stats.progress_store.upsert(
-                since_bj_iso=str(stats.since_bj_iso),
-                stage=str(stats.stage_name),
-                status="running",
-                cursor_text=progress_cursor,
-                current_index=progress_index,
-                total_count=int(stats.max_batches) if int(stats.max_batches) > 0 else 0,
-                detail={
-                    "last_oldest_bj": batch_oldest.isoformat() if batch_oldest else "",
-                    "last_newest_bj": batch_newest.isoformat() if batch_newest else "",
-                },
-            )
+            if not (str(stats.kind_name) == PROGRESS_STAGE_TIMELINE and is_empty_batch):
+                progress_index = int(stats.captured_batches)
+                progress_cursor = str(stats.captured_batches)
+                if (
+                    str(stats.stage_name) == PROGRESS_STAGE_TIMELINE
+                    and int(stats.current_page_number or 0) > 0
+                ):
+                    progress_index = int(stats.current_page_number)
+                    progress_cursor = str(stats.current_page_number)
+                stats.progress_store.upsert(
+                    since_bj_iso=str(stats.since_bj_iso),
+                    stage=str(stats.stage_name),
+                    status="running",
+                    cursor_text=progress_cursor,
+                    current_index=progress_index,
+                    total_count=int(stats.max_batches)
+                    if int(stats.max_batches) > 0
+                    else 0,
+                    detail={
+                        "last_oldest_bj": batch_oldest.isoformat()
+                        if batch_oldest
+                        else "",
+                        "last_newest_bj": batch_newest.isoformat()
+                        if batch_newest
+                        else "",
+                    },
+                )
         print(
             f"[{stats.kind_name}] 批次 {stats.captured_batches}: 原始 {len(records)} 条, 新增 {len(to_write)} 条, "
             f"日期 {_format_progress_dt(batch_newest)} -> {_format_progress_dt(batch_oldest)}",
             file=sys.stderr,
         )
 
-        if batch_oldest is not None and batch_oldest < stats.since_bj:
-            stats.consecutive_old_batches += 1
-        else:
-            stats.consecutive_old_batches = 0
+        if batch_oldest is not None:
+            if batch_oldest < stats.since_bj:
+                stats.consecutive_old_batches += 1
+            else:
+                stats.consecutive_old_batches = 0
 
     return _on_response
 
@@ -1626,7 +1676,24 @@ def _load_user_ids_from_file(path: Path) -> list[str]:
 
 
 def _resolve_target_user_ids(args: argparse.Namespace) -> list[str]:
-    return _load_user_ids_from_file(Path(args.user_list_file))
+    user_ids = _load_user_ids_from_file(Path(args.user_list_file))
+    start_user_id = str(getattr(args, "start_from_user", "") or "").strip()
+    if not start_user_id:
+        return user_ids
+
+    try:
+        start_index = user_ids.index(start_user_id)
+    except ValueError as e:
+        raise RuntimeError(
+            f"--start-from-user 指定的用户不在列表文件里：{start_user_id}"
+        ) from e
+
+    if start_index > 0:
+        print(
+            f"从用户 {start_user_id} 开始继续，跳过前面 {start_index} 个用户。",
+            file=sys.stderr,
+        )
+    return user_ids[start_index:]
 
 
 def _resolve_db_path(*, args: argparse.Namespace, out_dir: Path) -> Path:
