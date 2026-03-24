@@ -352,6 +352,11 @@ def _comment_display_text(record: dict[str, Any]) -> str:
     if not root_line:
         root_line = "原博文：(缺失)"
 
+    body_line = _comment_body_display_line(record)
+    return f"{root_line}{TALK_TEXT_SEPARATOR}{body_line}"
+
+
+def _comment_body_display_line(record: dict[str, Any]) -> str:
     text = str(record.get("text") or "").strip()
     if not text:
         raw_obj = _try_load_json_obj(record.get("raw_json"))
@@ -363,8 +368,7 @@ def _comment_display_text(record: dict[str, Any]) -> str:
     author = _author_label_from_raw_json(
         record.get("raw_json"), str(record.get("user_id") or "")
     )
-    body = f"{author}：{text}" if author else text
-    return f"{root_line}{TALK_TEXT_SEPARATOR}{body}"
+    return f"{author}：{text}" if author else text
 
 
 def _talk_chain_text_from_clean_obj(clean_obj: dict[str, Any]) -> str:
@@ -806,6 +810,16 @@ def _build_user_entries(
         record = source.get("record") or {}
         topic_status_id = _resolve_comment_topic_id(record, statuses_by_id)
         base_text = _base_status_text_for_comment(record, statuses_by_id)
+        # Prefer the root status line embedded in the comment payload, because
+        # it can include richer HTML (e.g. <img ...>) than timeline status text.
+        root_line = _root_status_display_line_from_comment_record(record)
+        if root_line:
+            base_text_str = str(base_text or "").strip()
+            root_line_str = str(root_line or "").strip()
+            if ("<img" in root_line_str.lower()) or (
+                len(root_line_str) > len(base_text_str)
+            ):
+                base_text = root_line_str
         source_status = statuses_by_id.get(
             str(
                 record.get("root_status_id")
@@ -819,10 +833,20 @@ def _build_user_entries(
                 status_record=source_status.get("record") or {},
                 resolve_status_line=resolve_status_line,
             )
-        chain_text = source.get("text") or _comment_display_text(record)
+
+        # Build chain text (comment + replies) without duplicating the root status line.
+        talk_source = talks_by_comment_id.get(str(comment_id))
+        chain_text = ""
+        if talk_source:
+            talk_payload = talk_source.get("payload") or {}
+            clean_obj = talk_payload.get("clean")
+            if isinstance(clean_obj, dict):
+                chain_text = _talk_chain_text_from_clean_obj(clean_obj)
+        if not chain_text:
+            chain_text = _comment_body_display_line(record)
+
         merged_text = _merge_display_text(base_text, chain_text)
         lines = _split_display_text(merged_text)
-        talk_source = talks_by_comment_id.get(str(comment_id))
         chain_candidates.append(
             {
                 "merge_key": f"{MERGE_KEY_ENTRY_CHAIN_PREFIX}{topic_status_id or 'unknown'}:{comment_id}",
