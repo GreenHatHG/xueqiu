@@ -21,6 +21,10 @@ _RE_IMG_TITLE = re.compile(
     r"""\btitle\s*=\s*(?P<q>["']?)(?P<title>[^"'\s>]*)(?P=q)""", re.IGNORECASE
 )
 
+# Xueqiu common reply/forward wrappers, used by "raw_text"-style outputs.
+_RE_REPLY_WRAPPER_PREFIX = re.compile(r"^(?:回复@[^:：]+[:：]\s*)+")
+_RE_FORWARD_SUFFIX = re.compile(r"\s*//@.*$")
+
 
 def _is_xueqiu_emoji_src(src: str) -> bool:
     s = (src or "").strip().lower()
@@ -86,3 +90,19 @@ def sanitize_xueqiu_text(text: Any) -> Optional[str]:
 
     s = _RE_IMG.sub(_img_repl, s)
     return s
+
+
+def strip_reply_wrappers(text: Any) -> str:
+    """
+    Remove Xueqiu reply/forward wrappers for "raw_text"-style plain text:
+
+    - Prefix: "回复@xxx:" / "回复@xxx：" (can repeat)
+    - Suffix: " //@..." (forward marker and quoted chain)
+    """
+
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = _RE_REPLY_WRAPPER_PREFIX.sub("", cleaned)
+    cleaned = _RE_FORWARD_SUFFIX.sub("", cleaned)
+    return cleaned.strip()

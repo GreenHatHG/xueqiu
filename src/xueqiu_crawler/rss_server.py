@@ -30,7 +30,15 @@ from .constants import (
     DEFAULT_OUTPUT_DIR,
 )
 from .sqlite_maintenance import maybe_cleanup_old_data
-from .storage import MERGED_TABLE_NAME, SqliteCrawlProgressStore, SqliteDb
+from .storage import (
+    MERGED_TABLE_NAME,
+    TALK_TEXT_SEPARATOR,
+    SqliteCrawlProgressStore,
+    SqliteDb,
+)
+from .text_sanitize import (
+    strip_reply_wrappers,
+)
 
 
 # Env vars for this service.
@@ -178,6 +186,37 @@ def _pick_title(text: str) -> str:
     return first
 
 
+def _rss_raw_text(text: str) -> str:
+    parts = [str(part).strip() for part in str(text or "").split(TALK_TEXT_SEPARATOR)]
+    parts = [part for part in parts if part]
+    if not parts:
+        return ""
+
+    out: list[str] = []
+    for part in parts:
+        s = str(part or "").strip()
+        if not s:
+            continue
+
+        if "：" in s:
+            speaker, body = s.split("：", 1)
+            speaker_text = str(speaker or "").strip()
+            body_text = str(body or "")
+            stripped_body = strip_reply_wrappers(body_text)
+            # Follow raw_text semantics: only use stripped result when it's non-empty.
+            final_body = stripped_body if stripped_body else body_text.strip()
+            if speaker_text and final_body:
+                out.append(f"{speaker_text}：{final_body}")
+            else:
+                out.append(stripped_body or s)
+            continue
+
+        stripped = strip_reply_wrappers(s)
+        out.append(stripped if stripped else s)
+
+    return TALK_TEXT_SEPARATOR.join([part for part in out if str(part).strip()])
+
+
 def _parse_entry_context(context_json: Any) -> dict[str, Any]:
     if context_json is None:
         return {}
@@ -243,7 +282,7 @@ def _query_latest_entries(*, db: SqliteDb, user_id: str, limit: int) -> list[Rss
     out: list[RssEntry] = []
     for row in cur:
         merge_key = str(row["merge_key"] or "").strip()
-        text = str(row["text"] or "")
+        text = _rss_raw_text(str(row["text"] or ""))
         ctx = _parse_entry_context(row["context_json"])
         title = _pick_title(text)
         link = _build_entry_link(user_id=str(user_id), ctx=ctx)

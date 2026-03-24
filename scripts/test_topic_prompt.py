@@ -23,7 +23,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from xueqiu_crawler.text_sanitize import sanitize_xueqiu_text
+from xueqiu_crawler.text_sanitize import sanitize_xueqiu_text, strip_reply_wrappers
 
 MERGED_TABLE_NAME = "merged_records"
 ASSERTIONS_TABLE_NAME = "assertions"
@@ -535,20 +535,11 @@ def _collapse_inline_whitespace(value: Any) -> str:
     return " ".join(str(value or "").split())
 
 
-def _strip_reply_wrappers(text: Any) -> str:
-    cleaned = str(text or "").strip()
-    if not cleaned:
-        return ""
-    cleaned = re.sub(r"^(?:回复@[^:：]+[:：]\s*)+", "", cleaned)
-    cleaned = re.sub(r"\s*//@.*$", "", cleaned)
-    return cleaned.strip()
-
-
 def _ai_compare_text(value: Any) -> str:
     text = _collapse_inline_whitespace(_clean_text(value))
     if not text:
         return ""
-    return _strip_reply_wrappers(text)
+    return strip_reply_wrappers(text)
 
 
 def _looks_like_same_message(left: Any, right: Any) -> bool:
@@ -1330,10 +1321,10 @@ def _build_internal_message_payload(
 def _build_prompt_message_text(message: dict[str, Any]) -> str:
     commentary_text = str(message.get("commentary_text") or "").strip()
     if commentary_text:
-        return _strip_reply_wrappers(commentary_text) or commentary_text
+        return strip_reply_wrappers(commentary_text) or commentary_text
 
     raw_text = str(message.get("text") or "").strip()
-    stripped_text = _strip_reply_wrappers(raw_text)
+    stripped_text = strip_reply_wrappers(raw_text)
     if stripped_text:
         return stripped_text
     return raw_text
