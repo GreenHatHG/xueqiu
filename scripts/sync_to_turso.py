@@ -27,6 +27,118 @@ TABLE_SYNC_CONFIG: dict[str, dict[str, str]] = {
     "topic_package_run_progress": {"cursor_col": "updated_at"},
 }
 
+
+STANDARD_TABLES = {"posts", "assertions"}
+
+STANDARD_POSTS_COLUMNS = [
+    "post_uid",
+    "platform",
+    "platform_post_id",
+    "author",
+    "created_at",
+    "url",
+    "raw_text",
+    "final_status",
+    "invest_score",
+    "processed_at",
+    "model",
+    "prompt_version",
+    "archived_at",
+]
+
+STANDARD_ASSERTIONS_COLUMNS = [
+    "post_uid",
+    "idx",
+    "topic_key",
+    "action",
+    "action_strength",
+    "summary",
+    "evidence",
+    "confidence",
+    "stock_codes_json",
+    "stock_names_json",
+    "industries_json",
+    "commodities_json",
+    "indices_json",
+]
+
+POSTS_STANDARD_SELECT_COLUMNS = [
+    "post_uid",
+    "platform",
+    "platform_post_id",
+    "author",
+    "created_at",
+    "url",
+    "raw_text",
+    "CASE WHEN status IN ('relevant','irrelevant') THEN status ELSE 'irrelevant' END AS final_status",
+    "invest_score",
+    "processed_at",
+    "model",
+    "prompt_version",
+    "COALESCE(NULLIF(processed_at, ''), NULLIF(created_at, ''), '') AS archived_at",
+]
+
+ASSERTIONS_STANDARD_SELECT_COLUMNS = [
+    "post_uid",
+    "idx",
+    "topic_key",
+    "action",
+    "action_strength",
+    "summary",
+    "evidence",
+    "confidence",
+    "stock_codes_json",
+    "stock_names_json",
+    "industries_json",
+    "commodities_json",
+    "indices_json",
+]
+
+STANDARD_POSTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS posts (
+  post_uid TEXT PRIMARY KEY,
+  platform TEXT,
+  platform_post_id TEXT,
+  author TEXT,
+  created_at TEXT,
+  url TEXT,
+  raw_text TEXT,
+  final_status TEXT,
+  invest_score REAL,
+  processed_at TEXT,
+  model TEXT,
+  prompt_version TEXT,
+  archived_at TEXT
+)
+"""
+
+STANDARD_ASSERTIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS assertions (
+  post_uid TEXT,
+  idx INTEGER,
+  topic_key TEXT,
+  action TEXT,
+  action_strength INTEGER,
+  summary TEXT,
+  evidence TEXT,
+  confidence REAL,
+  stock_codes_json TEXT,
+  stock_names_json TEXT,
+  industries_json TEXT,
+  commodities_json TEXT,
+  indices_json TEXT,
+  UNIQUE(post_uid, idx)
+)
+"""
+
+STANDARD_SCHEMA_INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_posts_author_created_at ON posts(author, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_posts_platform_post_id ON posts(platform_post_id)",
+    "CREATE INDEX IF NOT EXISTS idx_assertions_topic_key ON assertions(topic_key)",
+    "CREATE INDEX IF NOT EXISTS idx_assertions_action ON assertions(action)",
+]
+
 DEFAULT_TABLE_ORDER = [
     "raw_records",
     "merged_records",
@@ -125,6 +237,50 @@ def _inject_if_not_exists(sql: str) -> str:
     return sql
 
 
+def _standard_schema_sql() -> list[str]:
+    return [
+        STANDARD_POSTS_SCHEMA.strip(),
+        STANDARD_ASSERTIONS_SCHEMA.strip(),
+        *STANDARD_SCHEMA_INDEXES,
+    ]
+
+
+def _is_standard_table_related(row_type: str, name: str, sql: str) -> bool:
+    if name in STANDARD_TABLES:
+        return True
+    if row_type != "index":
+        return False
+    low = sql.lower()
+    for table in STANDARD_TABLES:
+        if f" on {table}" in low or f" on \"{table}\"" in low:
+            return True
+    return False
+
+
+def _standard_table_columns(table: str) -> Optional[list[str]]:
+    if table == "posts":
+        return list(STANDARD_POSTS_COLUMNS)
+    if table == "assertions":
+        return list(STANDARD_ASSERTIONS_COLUMNS)
+    return None
+
+
+def _standard_table_select_sql(table: str, cursor_expr: Optional[str]) -> Optional[str]:
+    if table == "posts":
+        columns = list(POSTS_STANDARD_SELECT_COLUMNS)
+    elif table == "assertions":
+        columns = list(ASSERTIONS_STANDARD_SELECT_COLUMNS)
+    else:
+        return None
+
+    if cursor_expr:
+        columns.append(f"{cursor_expr} AS __cursor_value")
+    sql = f'SELECT {", ".join(columns)} FROM "{table}"'
+    if cursor_expr:
+        sql += f" WHERE {cursor_expr} > ? ORDER BY {cursor_expr}"
+    return sql
+
+
 def _load_schema_sql(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         """
@@ -137,10 +293,16 @@ def _load_schema_sql(conn: sqlite3.Connection) -> list[str]:
     ).fetchall()
     statements: list[str] = []
     for row in rows:
+        row_type = str(row[0] or "").strip().lower()
+        name = str(row[1] or "").strip()
         sql = str(row[2] or "").strip()
         if not sql:
             continue
+        if _is_standard_table_related(row_type, name, sql):
+            continue
         statements.append(_inject_if_not_exists(sql))
+
+    statements.extend(_standard_schema_sql())
     return statements
 
 
@@ -157,6 +319,9 @@ def _get_user_tables(conn: sqlite3.Connection) -> list[str]:
 
 
 def _get_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    standard = _standard_table_columns(table)
+    if standard is not None:
+        return standard
     rows = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
     return [str(row[1]) for row in rows]
 
@@ -191,6 +356,15 @@ def _build_incremental_query(table: str, cursor_expr: str) -> str:
 def _build_max_cursor_query(table: str, cursor_expr: str) -> str:
     return f'SELECT MAX({cursor_expr}) FROM "{table}"'
 
+def _build_select_sql(table: str, cursor_expr: Optional[str], *, incremental: bool) -> str:
+    standard_sql = _standard_table_select_sql(table, cursor_expr if incremental else None)
+    if standard_sql:
+        return standard_sql
+    if incremental and cursor_expr:
+        return _build_incremental_query(table, cursor_expr)
+    return f'SELECT * FROM "{table}"'
+
+
 
 def _run_turso(
     sql_text: str,
@@ -213,6 +387,7 @@ def _sync_table_full(
     *,
     table: str,
     columns: list[str],
+    select_sql: str,
     batch_size: int,
     turso_db: str,
     dry_run: bool,
@@ -221,7 +396,7 @@ def _sync_table_full(
 ) -> None:
     total = _count_rows(conn, table, cursor_expr=None, last_value="")
     processed = 0
-    cursor = conn.execute(f'SELECT * FROM "{table}"')
+    cursor = conn.execute(select_sql)
     while True:
         rows = cursor.fetchmany(batch_size)
         if not rows:
@@ -239,6 +414,7 @@ def _sync_table_incremental(
     table: str,
     columns: list[str],
     cursor_expr: str,
+    select_sql: str,
     batch_size: int,
     turso_db: str,
     dry_run: bool,
@@ -248,7 +424,7 @@ def _sync_table_incremental(
     last_value = _get_meta(conn, table)
     total = _count_rows(conn, table, cursor_expr=cursor_expr, last_value=last_value)
     processed = 0
-    cursor = conn.execute(_build_incremental_query(table, cursor_expr), (last_value,))
+    cursor = conn.execute(select_sql, (last_value,))
     while True:
         rows = cursor.fetchmany(batch_size)
         if not rows:
@@ -333,6 +509,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    dry_run = args.dry_run
+
     db_path = Path(args.db)
     if not db_path.exists():
         raise SystemExit(f"sqlite file not found: {db_path}")
@@ -373,15 +551,18 @@ def main() -> None:
         if not columns:
             continue
         cursor_expr = _get_cursor_expr(table)
-        if args.incremental and cursor_expr:
+        incremental = bool(args.incremental and cursor_expr)
+        select_sql = _build_select_sql(table, cursor_expr, incremental=incremental)
+        if incremental:
             _sync_table_incremental(
                 conn,
                 table=table,
                 columns=columns,
                 cursor_expr=cursor_expr,
+                select_sql=select_sql,
                 batch_size=int(args.batch_size),
                 turso_db=turso_db,
-                dry_run=args.dry_run,
+                dry_run=dry_run,
                 progress=args.progress,
                 shell_cmd=shell_cmd,
             )
@@ -390,9 +571,10 @@ def main() -> None:
                 conn,
                 table=table,
                 columns=columns,
+                select_sql=select_sql,
                 batch_size=int(args.batch_size),
                 turso_db=turso_db,
-                dry_run=args.dry_run,
+                dry_run=dry_run,
                 progress=args.progress,
                 shell_cmd=shell_cmd,
             )
