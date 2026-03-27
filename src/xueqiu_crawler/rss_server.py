@@ -172,6 +172,7 @@ class RssEntry:
     guid: str
     title: str
     link: str
+    author: str
     description: str
     pub_date_rfc2822: str
 
@@ -270,7 +271,7 @@ def _to_rfc2822(value: Any) -> str:
 def _query_latest_entries(*, db: SqliteDb, user_id: str, limit: int) -> list[RssEntry]:
     cur = db.conn.execute(
         f"""
-        SELECT merge_key, created_at_bj, text, context_json
+        SELECT merge_key, username, created_at_bj, text, context_json
         FROM {MERGED_TABLE_NAME}
         WHERE user_id = ?
           AND merge_key LIKE 'entry:%'
@@ -282,6 +283,7 @@ def _query_latest_entries(*, db: SqliteDb, user_id: str, limit: int) -> list[Rss
     out: list[RssEntry] = []
     for row in cur:
         merge_key = str(row["merge_key"] or "").strip()
+        author = str(row["username"] or "").strip()
         text = _rss_raw_text(str(row["text"] or ""))
         ctx = _parse_entry_context(row["context_json"])
         title = _pick_title(text)
@@ -292,6 +294,7 @@ def _query_latest_entries(*, db: SqliteDb, user_id: str, limit: int) -> list[Rss
                 guid=merge_key or link,
                 title=title,
                 link=link,
+                author=author,
                 description=text,
                 pub_date_rfc2822=pub_date,
             )
@@ -319,6 +322,8 @@ def _build_rss_xml(*, user_id: str, entries: list[RssEntry]) -> bytes:
         item = ET.SubElement(channel, "item")
         ET.SubElement(item, "title").text = e.title
         ET.SubElement(item, "link").text = e.link
+        if e.author:
+            ET.SubElement(item, "author").text = e.author
         if e.guid:
             guid_node = ET.SubElement(item, "guid")
             guid_node.text = e.guid
