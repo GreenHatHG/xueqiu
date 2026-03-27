@@ -32,6 +32,8 @@ from .constants import (
 from .sqlite_maintenance import maybe_cleanup_old_data
 from .storage import (
     MERGED_TABLE_NAME,
+    MERGE_KEY_ENTRY_CHAIN_PREFIX,
+    MERGE_KEY_ENTRY_STATUS_PREFIX,
     TALK_TEXT_SEPARATOR,
     SqliteCrawlProgressStore,
     SqliteDb,
@@ -65,6 +67,10 @@ _USER_LOCKS_GUARD = threading.Lock()
 _DB_MAINTENANCE_LOCK = threading.Lock()
 
 DEFAULT_ROOT_TEXT = "ok\nTry: /u/{user_id}?limit=20&key=YOUR_KEY\n"
+
+POST_UID_PLATFORM = "xueqiu"
+POST_UID_KIND_STATUS = "status"
+POST_UID_KIND_COMMENT = "comment"
 
 
 def _get_user_lock(user_id: str) -> threading.Lock:
@@ -235,6 +241,50 @@ def _parse_entry_context(context_json: Any) -> dict[str, Any]:
     return obj if isinstance(obj, dict) else {}
 
 
+def _build_post_uid(*, source_kind: str, source_id: str) -> str:
+    kind = str(source_kind or "").strip()
+    sid = str(source_id or "").strip()
+    if not kind or not sid:
+        return ""
+    return f"{POST_UID_PLATFORM}:{kind}:{sid}"
+
+
+def _post_uid_from_entry(*, merge_key: str, ctx: dict[str, Any]) -> str:
+    entry_type = str(ctx.get("entry_type") or "").strip()
+
+    if entry_type == POST_UID_KIND_STATUS:
+        status_id = str(ctx.get("status_id") or "").strip()
+        if status_id:
+            return _build_post_uid(
+                source_kind=POST_UID_KIND_STATUS, source_id=status_id
+            )
+
+    if entry_type == "chain":
+        comment_id = str(ctx.get("comment_id") or "").strip()
+        if comment_id:
+            return _build_post_uid(
+                source_kind=POST_UID_KIND_COMMENT, source_id=comment_id
+            )
+
+    key = str(merge_key or "").strip()
+    if key.startswith(MERGE_KEY_ENTRY_STATUS_PREFIX):
+        status_id = key[len(MERGE_KEY_ENTRY_STATUS_PREFIX) :].strip()
+        if status_id:
+            return _build_post_uid(
+                source_kind=POST_UID_KIND_STATUS, source_id=status_id
+            )
+
+    if key.startswith(MERGE_KEY_ENTRY_CHAIN_PREFIX):
+        rest = key[len(MERGE_KEY_ENTRY_CHAIN_PREFIX) :].strip()
+        comment_id = rest.rsplit(":", 1)[-1].strip() if rest else ""
+        if comment_id:
+            return _build_post_uid(
+                source_kind=POST_UID_KIND_COMMENT, source_id=comment_id
+            )
+
+    return ""
+
+
 def _build_entry_link(*, user_id: str, ctx: dict[str, Any]) -> str:
     entry_type = str(ctx.get("entry_type") or "").strip()
     if entry_type == "chain":
@@ -288,10 +338,11 @@ def _query_latest_entries(*, db: SqliteDb, user_id: str, limit: int) -> list[Rss
         ctx = _parse_entry_context(row["context_json"])
         title = _pick_title(text)
         link = _build_entry_link(user_id=str(user_id), ctx=ctx)
+        post_uid = _post_uid_from_entry(merge_key=merge_key, ctx=ctx)
         pub_date = _to_rfc2822(row["created_at_bj"])
         out.append(
             RssEntry(
-                guid=merge_key or link,
+                guid=post_uid or merge_key or link,
                 title=title,
                 link=link,
                 author=author,
@@ -326,7 +377,12 @@ def _build_rss_xml(*, user_id: str, entries: list[RssEntry]) -> bytes:
             ET.SubElement(item, "author").text = e.author
         if e.guid:
             guid_node = ET.SubElement(item, "guid")
-            guid_node.text = e.guid
+            guid_text = str(e.guid)
+            if not (
+                guid_text.startswith("http://") or guid_text.startswith("https://")
+            ):
+                guid_node.set("isPermaLink", "false")
+            guid_node.text = guid_text
         if e.pub_date_rfc2822:
             ET.SubElement(item, "pubDate").text = e.pub_date_rfc2822
         # Keep the DB `text` as-is (escaped by ElementTree).
