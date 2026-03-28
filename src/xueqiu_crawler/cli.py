@@ -2653,6 +2653,7 @@ def _run_single_user_incremental_http(
         jitter_sec=args.jitter,
         max_retries=args.max_retries,
         max_consecutive_blocks=args.max_consecutive_blocks,
+        http_debug=bool(getattr(args, "http_debug", False)),
     )
     timeline_store = SqliteMergedStatusesStore(
         db=db, user_id=str(user_id), table_name=RAW_TABLE_NAME

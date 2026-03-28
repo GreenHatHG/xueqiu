@@ -81,6 +81,7 @@
     - `XQ_RSS_KEY`：必须（访问 RSS 时要带 `key`）
     - `XQ_RSS_TTL_SEC`：缓存秒数（默认 300）
     - `XQ_RSS_DB_PATH`：SQLite 路径（默认 `data/xueqiu_batch.sqlite3`）
+    - `XQ_HTTP_DEBUG`：可选（`1/true/yes/on` 开启增量 HTTP 调试日志；失败时会打印短正文预览）
     - `PORT`：可选（不传 `--port` 时会用它）
   - 本地跑：
     - `export XUEQIU_COOKIE='xq_a_token=...; u=...; ...'`
@@ -91,7 +92,7 @@
   - Docker 跑（不安装 Playwright/浏览器依赖）：
     - 构建：`docker build -t xq-rss .`
     - 运行（把 SQLite 挂到 volume，重启不丢）：
-      - `docker run --rm -p 8000:8000 -e XUEQIU_COOKIE='...' -e XQ_RSS_KEY='your_key' -e XQ_RSS_TTL_SEC=300 -v xq_data:/app/data xq-rss`
+      - `docker run --rm -p 8000:8000 -e XUEQIU_COOKIE='...' -e XQ_RSS_KEY='your_key' -e XQ_RSS_TTL_SEC=300 -e XQ_HTTP_DEBUG=1 -v xq_data:/app/data xq-rss`
   - 失败行为：
     - TTL 过期且抓取失败 → 直接返回 HTTP 502（方便监控）
 - 指定统一数据库：

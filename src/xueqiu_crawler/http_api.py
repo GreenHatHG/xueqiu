@@ -12,6 +12,12 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .constants import BASE_URL, TALKS_PAGE_SIZE, USER_COMMENTS_PAGE_SIZE
+from .http_debug import (
+    sanitize_url_for_debug,
+    single_line_text,
+    summarize_payload,
+    text_preview,
+)
 from .rate_limit import RateLimiter
 from .text_sanitize import sanitize_xueqiu_text
 from .xq_api import (
@@ -83,6 +89,13 @@ class XueqiuHttpApi:
     @classmethod
     def from_env(cls, cfg: ApiConfig) -> "XueqiuHttpApi":
         return cls(cfg, HttpClientConfig(cookie=_require_cookie_from_env()))
+
+    def _http_debug_enabled(self) -> bool:
+        return bool(getattr(self._cfg, "http_debug", False))
+
+    def _http_debug_log(self, message: str) -> None:
+        if self._http_debug_enabled():
+            print(f"[http-debug] {message}", file=sys.stderr)
 
     def build_url(self, path: str, params: Optional[dict[str, Any]] = None) -> str:
         p = str(path or "").strip()
@@ -198,12 +211,27 @@ class XueqiuHttpApi:
         backoff = 3.0
         last_exc: Optional[Exception] = None
         label = str(request_label or url)
+        total_attempts = int(self._cfg.max_retries) + 1
 
-        for attempt in range(int(self._cfg.max_retries) + 1):
+        for attempt in range(total_attempts):
+            attempt_started = time.monotonic()
+            attempt_no = int(attempt) + 1
+            self._http_debug_log(
+                f"{label} attempt={attempt_no}/{total_attempts} request "
+                f"url={sanitize_url_for_debug(url)} "
+                f"referrer={sanitize_url_for_debug(str(referrer or ''))}"
+            )
             try:
                 status, text, final_url = self._fetch_text_once(url, referrer=referrer)
 
                 looks_html = _looks_like_html(text)
+                elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
+                self._http_debug_log(
+                    f"{label} attempt={attempt_no}/{total_attempts} response "
+                    f"status={int(status)} elapsed_ms={elapsed_ms} body_len={len(text)} "
+                    f"looks_html={int(bool(looks_html))} "
+                    f"final_url={sanitize_url_for_debug(final_url)}"
+                )
                 if status in (401, 403, 429):
                     raise BlockedError(f"blocked or not logged in (status={status})")
                 if looks_html:
@@ -226,6 +254,13 @@ class XueqiuHttpApi:
                 try:
                     obj = json.loads(text)
                 except Exception as e:
+                    preview, truncated, total_len = text_preview(text)
+                    self._http_debug_log(
+                        f"{label} attempt={attempt_no}/{total_attempts} json_parse_failed "
+                        f"status={int(status)} text_len={total_len} "
+                        f"text_head={single_line_text(preview)} truncated={int(truncated)} "
+                        f"error={single_line_text(str(e))}"
+                    )
                     if (
                         ("alichlgref=" in final_url.lower())
                         or ("md5__1038=" in final_url.lower())
@@ -247,6 +282,20 @@ class XueqiuHttpApi:
 
                 issue = retry_reason(obj) if retry_reason is not None else None
                 if issue is not None:
+                    payload_summary = summarize_payload(obj)
+                    preview, truncated, total_len = text_preview(text)
+                    self._http_debug_log(
+                        f"{label} attempt={attempt_no}/{total_attempts} bad_payload "
+                        f"status={int(status)} issue={single_line_text(str(issue))} "
+                        f"{payload_summary} "
+                        f"url={sanitize_url_for_debug(url)} "
+                        f"final_url={sanitize_url_for_debug(final_url)}"
+                    )
+                    self._http_debug_log(
+                        f"{label} attempt={attempt_no}/{total_attempts} bad_payload "
+                        f"text_len={total_len} text_head={single_line_text(preview)} "
+                        f"truncated={int(truncated)}"
+                    )
                     if attempt < int(self._cfg.max_retries):
                         print(
                             f"[api-retry] {label} bad payload, attempt {attempt + 1}/{int(self._cfg.max_retries) + 1}: {issue}",
@@ -260,12 +309,23 @@ class XueqiuHttpApi:
                 self._consecutive_blocks = 0
                 return obj
             except ChallengeRequiredError:
+                self._http_debug_log(
+                    f"{label} attempt={attempt_no}/{total_attempts} challenge_required"
+                )
                 raise
             except BlockedError as e:
                 self._consecutive_blocks += 1
                 last_exc = e
+                self._http_debug_log(
+                    f"{label} attempt={attempt_no}/{total_attempts} blocked "
+                    f"error={single_line_text(str(e))}"
+                )
             except Exception as e:
                 last_exc = e
+                self._http_debug_log(
+                    f"{label} attempt={attempt_no}/{total_attempts} failed "
+                    f"error={single_line_text(str(e))}"
+                )
 
             if attempt < int(self._cfg.max_retries):
                 if last_exc is not None:

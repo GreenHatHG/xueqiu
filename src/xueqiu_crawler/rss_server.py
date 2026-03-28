@@ -29,6 +29,7 @@ from .constants import (
     DEFAULT_MIN_DELAY_SEC,
     DEFAULT_OUTPUT_DIR,
 )
+from .http_debug import env_flag_enabled
 from .sqlite_maintenance import maybe_cleanup_old_data
 from .storage import (
     MERGED_TABLE_NAME,
@@ -47,6 +48,7 @@ from .text_sanitize import (
 XQ_RSS_DB_PATH_ENV = "XQ_RSS_DB_PATH"
 XQ_RSS_TTL_SEC_ENV = "XQ_RSS_TTL_SEC"
 XQ_RSS_KEY_ENV = "XQ_RSS_KEY"
+XQ_HTTP_DEBUG_ENV = "XQ_HTTP_DEBUG"
 
 # Query params.
 RSS_KEY_QUERY_PARAM = "key"
@@ -167,6 +169,7 @@ def _build_incremental_http_args() -> argparse.Namespace:
         jitter=float(DEFAULT_JITTER_SEC),
         max_retries=int(DEFAULT_MAX_RETRIES),
         max_consecutive_blocks=int(DEFAULT_MAX_CONSECUTIVE_BLOCKS),
+        http_debug=env_flag_enabled(_env_str(XQ_HTTP_DEBUG_ENV)),
         with_talks=False,
         no_talks=False,  # want talks by default
         max_talk_pages=int(DEFAULT_CORE_MAX_TALK_PAGES),

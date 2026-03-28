@@ -129,6 +129,7 @@ class ApiConfig:
     jitter_sec: float
     max_retries: int
     max_consecutive_blocks: int
+    http_debug: bool = False
 
 
 class XueqiuApi:
