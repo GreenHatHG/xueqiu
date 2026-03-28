@@ -2682,6 +2682,7 @@ def _run_single_user_incremental_http(
     wrote_comments = 0
     wrote_talks = 0
     had_blocked = False
+    had_failure = False
     refs: list[dict[str, Any]] = []
 
     print(f"{user_log_prefix} timeline HTTP 开始抓取 page=1", file=sys.stderr)
@@ -2696,11 +2697,14 @@ def _run_single_user_incremental_http(
         )
     except ChallengeRequiredError as e:
         had_blocked = True
+        had_failure = True
         print(f"{user_log_prefix} timeline HTTP 被风控拦截：{e}", file=sys.stderr)
     except BlockedError as e:
         had_blocked = True
+        had_failure = True
         print(f"{user_log_prefix} timeline HTTP 不可用：{e}", file=sys.stderr)
     except Exception as e:
+        had_failure = True
         print(f"{user_log_prefix} timeline HTTP 抓取失败：{e}", file=sys.stderr)
     timeline_elapsed = time.monotonic() - timeline_started
     print(
@@ -2720,11 +2724,14 @@ def _run_single_user_incremental_http(
         )
     except ChallengeRequiredError as e:
         had_blocked = True
+        had_failure = True
         print(f"{user_log_prefix} comments HTTP 被风控拦截：{e}", file=sys.stderr)
     except BlockedError as e:
         had_blocked = True
+        had_failure = True
         print(f"{user_log_prefix} comments HTTP 不可用：{e}", file=sys.stderr)
     except Exception as e:
+        had_failure = True
         print(f"{user_log_prefix} comments HTTP 抓取失败：{e}", file=sys.stderr)
     comments_elapsed = time.monotonic() - comments_started
     print(
@@ -2749,11 +2756,14 @@ def _run_single_user_incremental_http(
                 )
             except ChallengeRequiredError as e:
                 had_blocked = True
+                had_failure = True
                 print(f"{user_log_prefix} talks HTTP 被风控拦截：{e}", file=sys.stderr)
             except BlockedError as e:
                 had_blocked = True
+                had_failure = True
                 print(f"{user_log_prefix} talks HTTP 不可用：{e}", file=sys.stderr)
             except Exception as e:
+                had_failure = True
                 print(f"{user_log_prefix} talks HTTP 抓取失败：{e}", file=sys.stderr)
             talks_elapsed = time.monotonic() - talks_started
             print(
@@ -2816,12 +2826,18 @@ def _run_single_user_incremental_http(
         f"{user_log_prefix} HTTP 增量模式结束，耗时 {total_elapsed:.1f}s",
         file=sys.stderr,
     )
-    if had_blocked and did_write == 0:
-        print(
-            f"{user_log_prefix} 提示：HTTP 模式下接口被拦截/返回非 JSON。"
-            "这通常意味着 Cookie 失效或触发了 WAF 挑战页；云上无法手动验证，需要更新 Cookie 或改用浏览器模式。",
-            file=sys.stderr,
-        )
+    if had_failure:
+        if had_blocked and did_write == 0:
+            print(
+                f"{user_log_prefix} 提示：HTTP 模式下接口被拦截/返回非 JSON。"
+                "这通常意味着 Cookie 失效或触发了 WAF 挑战页；云上无法手动验证，需要更新 Cookie 或改用浏览器模式。",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"{user_log_prefix} 本轮抓取存在失败，返回失败码以便上层感知。",
+                file=sys.stderr,
+            )
         return 2
     return 0
 

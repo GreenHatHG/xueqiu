@@ -200,6 +200,32 @@ class XueqiuHttpApi:
         next_id = str(obj.get("next_id") or "").strip()
         return next_max_id == "-1" and next_id == "-1"
 
+    @staticmethod
+    def _extract_timeline_rows(obj: Any) -> Optional[list[Any]]:
+        if not isinstance(obj, dict):
+            return None
+        candidates: list[Any] = [obj.get("statuses"), obj.get("list"), obj.get("items")]
+        data_obj = obj.get("data")
+        if isinstance(data_obj, dict):
+            candidates.extend(
+                [data_obj.get("statuses"), data_obj.get("list"), data_obj.get("items")]
+            )
+        elif isinstance(data_obj, list):
+            candidates.append(data_obj)
+        for value in candidates:
+            if isinstance(value, list):
+                return value
+        return None
+
+    @classmethod
+    def _describe_timeline_payload_issue(cls, obj: Any) -> Optional[str]:
+        if not isinstance(obj, dict):
+            return "timeline payload is not an object"
+        rows = cls._extract_timeline_rows(obj)
+        if rows is None:
+            return "timeline payload missing statuses/list/items"
+        return None
+
     def _fetch_json_with_retry(
         self,
         url: str,
@@ -364,6 +390,7 @@ class XueqiuHttpApi:
                 obj = self._fetch_json_with_retry(
                     url,
                     referrer=ref,
+                    retry_reason=self._describe_timeline_payload_issue,
                     request_label=f"timeline user={uid} page=1",
                 )
                 return obj if isinstance(obj, dict) else {"data": obj}
