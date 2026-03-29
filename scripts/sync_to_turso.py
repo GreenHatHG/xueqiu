@@ -7,12 +7,13 @@ import os
 import shlex
 import sqlite3
 import subprocess
-import sys
 from pathlib import Path
 from typing import Iterable, Optional
 
 
 SYNC_META_TABLE = "sync_meta"
+DEFAULT_TURSO_RECONNECT_ATTEMPTS = 1
+DEFAULT_TURSO_SHELL_CMD_PREFIX = ("turso", "db", "shell")
 
 TABLE_SYNC_CONFIG: dict[str, dict[str, str]] = {
     "raw_records": {"cursor_col": "fetched_at_bj"},
@@ -225,7 +226,9 @@ def _inject_if_not_exists(sql: str) -> str:
     stripped = sql.lstrip()
     prefix = sql[: len(sql) - len(stripped)]
     if stripped.startswith("CREATE TABLE "):
-        return prefix + stripped.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1)
+        return prefix + stripped.replace(
+            "CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1
+        )
     if stripped.startswith("CREATE UNIQUE INDEX "):
         return prefix + stripped.replace(
             "CREATE UNIQUE INDEX ", "CREATE UNIQUE INDEX IF NOT EXISTS ", 1
@@ -252,7 +255,7 @@ def _is_standard_table_related(row_type: str, name: str, sql: str) -> bool:
         return False
     low = sql.lower()
     for table in STANDARD_TABLES:
-        if f" on {table}" in low or f" on \"{table}\"" in low:
+        if f" on {table}" in low or f' on "{table}"' in low:
             return True
     return False
 
@@ -356,8 +359,13 @@ def _build_incremental_query(table: str, cursor_expr: str) -> str:
 def _build_max_cursor_query(table: str, cursor_expr: str) -> str:
     return f'SELECT MAX({cursor_expr}) FROM "{table}"'
 
-def _build_select_sql(table: str, cursor_expr: Optional[str], *, incremental: bool) -> str:
-    standard_sql = _standard_table_select_sql(table, cursor_expr if incremental else None)
+
+def _build_select_sql(
+    table: str, cursor_expr: Optional[str], *, incremental: bool
+) -> str:
+    standard_sql = _standard_table_select_sql(
+        table, cursor_expr if incremental else None
+    )
     if standard_sql:
         return standard_sql
     if incremental and cursor_expr:
@@ -365,21 +373,116 @@ def _build_select_sql(table: str, cursor_expr: Optional[str], *, incremental: bo
     return f'SELECT * FROM "{table}"'
 
 
+class TursoShellSession:
+    def __init__(
+        self,
+        *,
+        turso_db: str,
+        shell_cmd: Optional[list[str]],
+        reconnect_attempts: int = DEFAULT_TURSO_RECONNECT_ATTEMPTS,
+    ) -> None:
+        self._cmd = (
+            list(shell_cmd)
+            if shell_cmd
+            else [*DEFAULT_TURSO_SHELL_CMD_PREFIX, turso_db]
+        )
+        self._reconnect_attempts = max(0, int(reconnect_attempts))
+        self._process: Optional[subprocess.Popen[str]] = None
+
+    def __enter__(self) -> "TursoShellSession":
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb) -> None:
+        self.close()
+
+    def execute(self, sql_text: str) -> None:
+        if not sql_text.strip():
+            return
+
+        max_attempts = self._reconnect_attempts + 1
+        for attempt in range(max_attempts):
+            process = self._ensure_process()
+            try:
+                stdin = process.stdin
+                if stdin is None:
+                    raise RuntimeError("turso shell stdin unavailable")
+                stdin.write(sql_text)
+                if not sql_text.endswith("\n"):
+                    stdin.write("\n")
+                stdin.flush()
+            except (BrokenPipeError, OSError, ValueError, RuntimeError) as exc:
+                self._close_process()
+                if attempt + 1 < max_attempts:
+                    continue
+                raise RuntimeError("failed to send SQL to turso shell") from exc
+
+            if process.poll() is None:
+                return
+
+            error = RuntimeError(
+                f"turso shell exited while executing SQL (code={process.returncode})"
+            )
+            self._close_process()
+            if attempt + 1 < max_attempts:
+                continue
+            raise error
+
+    def close(self) -> None:
+        self._close_process()
+
+    def _ensure_process(self) -> subprocess.Popen[str]:
+        if self._process is not None and self._process.poll() is None:
+            return self._process
+
+        self._close_process()
+        self._process = subprocess.Popen(  # noqa: S603
+            self._cmd,
+            stdin=subprocess.PIPE,
+            text=True,
+        )
+        return self._process
+
+    def _close_process(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        self._process = None
+
+        stdin = process.stdin
+        if stdin is not None and not stdin.closed:
+            try:
+                stdin.close()
+            except Exception:
+                pass
+
+        if process.poll() is not None:
+            return
+
+        try:
+            process.terminate()
+            process.wait(timeout=5)
+        except Exception:
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except Exception:
+                pass
+
 
 def _run_turso(
     sql_text: str,
     *,
-    turso_db: str,
     dry_run: bool,
-    shell_cmd: Optional[list[str]] = None,
+    session: Optional["TursoShellSession"],
 ) -> None:
     if not sql_text.strip():
         return
     if dry_run:
         print(sql_text)
         return
-    cmd = shell_cmd or ["turso", "db", "shell", turso_db]
-    subprocess.run(cmd, input=sql_text, text=True, check=True)
+    if session is None:
+        raise RuntimeError("missing turso session")
+    session.execute(sql_text)
 
 
 def _sync_table_full(
@@ -389,10 +492,9 @@ def _sync_table_full(
     columns: list[str],
     select_sql: str,
     batch_size: int,
-    turso_db: str,
     dry_run: bool,
     progress: bool,
-    shell_cmd: Optional[list[str]],
+    session: Optional[TursoShellSession],
 ) -> None:
     total = _count_rows(conn, table, cursor_expr=None, last_value="")
     processed = 0
@@ -402,7 +504,7 @@ def _sync_table_full(
         if not rows:
             break
         sql = "BEGIN;\n" + _build_insert_sql(table, columns, rows) + "COMMIT;\n"
-        _run_turso(sql, turso_db=turso_db, dry_run=dry_run, shell_cmd=shell_cmd)
+        _run_turso(sql, dry_run=dry_run, session=session)
         processed += len(rows)
         if progress:
             print(f"[{table}] {processed}/{total} rows")
@@ -416,10 +518,9 @@ def _sync_table_incremental(
     cursor_expr: str,
     select_sql: str,
     batch_size: int,
-    turso_db: str,
     dry_run: bool,
     progress: bool,
-    shell_cmd: Optional[list[str]],
+    session: Optional[TursoShellSession],
 ) -> None:
     last_value = _get_meta(conn, table)
     total = _count_rows(conn, table, cursor_expr=cursor_expr, last_value=last_value)
@@ -430,7 +531,7 @@ def _sync_table_incremental(
         if not rows:
             break
         sql = "BEGIN;\n" + _build_insert_sql(table, columns, rows) + "COMMIT;\n"
-        _run_turso(sql, turso_db=turso_db, dry_run=dry_run, shell_cmd=shell_cmd)
+        _run_turso(sql, dry_run=dry_run, session=session)
         processed += len(rows)
         if progress:
             print(f"[{table}] {processed}/{total} rows")
@@ -526,66 +627,74 @@ def main() -> None:
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    _ensure_sync_meta(conn)
-
-    tables = _order_tables(_get_user_tables(conn))
-    include_tables = _parse_table_list(args.include)
-    exclude_tables = _parse_table_list(args.exclude)
-    if include_tables:
-        tables = [name for name in tables if name in include_tables]
-    if exclude_tables:
-        tables = [name for name in tables if name not in exclude_tables]
-
-    if args.full:
-        schema_sql = _load_schema_sql(conn)
-        if schema_sql:
-            _run_turso(
-                "BEGIN;\n" + ";\n".join(schema_sql) + ";\nCOMMIT;\n",
+    session: Optional[TursoShellSession] = None
+    try:
+        _ensure_sync_meta(conn)
+        if not dry_run:
+            session = TursoShellSession(
                 turso_db=turso_db,
-                dry_run=args.dry_run,
                 shell_cmd=shell_cmd,
+                reconnect_attempts=DEFAULT_TURSO_RECONNECT_ATTEMPTS,
             )
 
-    for table in tables:
-        columns = _get_columns(conn, table)
-        if not columns:
-            continue
-        cursor_expr = _get_cursor_expr(table)
-        incremental = bool(args.incremental and cursor_expr)
-        select_sql = _build_select_sql(table, cursor_expr, incremental=incremental)
-        if incremental:
-            _sync_table_incremental(
-                conn,
-                table=table,
-                columns=columns,
-                cursor_expr=cursor_expr,
-                select_sql=select_sql,
-                batch_size=int(args.batch_size),
-                turso_db=turso_db,
-                dry_run=dry_run,
-                progress=args.progress,
-                shell_cmd=shell_cmd,
-            )
-        else:
-            _sync_table_full(
-                conn,
-                table=table,
-                columns=columns,
-                select_sql=select_sql,
-                batch_size=int(args.batch_size),
-                turso_db=turso_db,
-                dry_run=dry_run,
-                progress=args.progress,
-                shell_cmd=shell_cmd,
-            )
-        if cursor_expr and not args.incremental:
-            max_row = conn.execute(
-                _build_max_cursor_query(table, cursor_expr)
-            ).fetchone()
-            max_value = "" if not max_row or max_row[0] is None else str(max_row[0])
-            _set_meta(conn, table, max_value)
+        tables = _order_tables(_get_user_tables(conn))
+        include_tables = _parse_table_list(args.include)
+        exclude_tables = _parse_table_list(args.exclude)
+        if include_tables:
+            tables = [name for name in tables if name in include_tables]
+        if exclude_tables:
+            tables = [name for name in tables if name not in exclude_tables]
 
-    conn.close()
+        if args.full:
+            schema_sql = _load_schema_sql(conn)
+            if schema_sql:
+                _run_turso(
+                    "BEGIN;\n" + ";\n".join(schema_sql) + ";\nCOMMIT;\n",
+                    dry_run=args.dry_run,
+                    session=session,
+                )
+
+        for table in tables:
+            columns = _get_columns(conn, table)
+            if not columns:
+                continue
+            cursor_expr = _get_cursor_expr(table)
+            incremental = bool(args.incremental and cursor_expr)
+            select_sql = _build_select_sql(table, cursor_expr, incremental=incremental)
+            if incremental:
+                assert cursor_expr is not None
+                _sync_table_incremental(
+                    conn,
+                    table=table,
+                    columns=columns,
+                    cursor_expr=cursor_expr,
+                    select_sql=select_sql,
+                    batch_size=int(args.batch_size),
+                    dry_run=dry_run,
+                    progress=args.progress,
+                    session=session,
+                )
+            else:
+                _sync_table_full(
+                    conn,
+                    table=table,
+                    columns=columns,
+                    select_sql=select_sql,
+                    batch_size=int(args.batch_size),
+                    dry_run=dry_run,
+                    progress=args.progress,
+                    session=session,
+                )
+            if cursor_expr and not args.incremental:
+                max_row = conn.execute(
+                    _build_max_cursor_query(table, cursor_expr)
+                ).fetchone()
+                max_value = "" if not max_row or max_row[0] is None else str(max_row[0])
+                _set_meta(conn, table, max_value)
+    finally:
+        if session is not None:
+            session.close()
+        conn.close()
 
 
 if __name__ == "__main__":
