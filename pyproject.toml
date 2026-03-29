@@ -9,6 +9,7 @@ requires-python = ">=3.10"
 dependencies = [
   "litellm>=1.82.1",
   "fastapi>=0.111.0",
+  "libsql",
   "playwright>=1.41",
   "playwright-stealth>=2.0.2",
   "uvicorn>=0.30.0",

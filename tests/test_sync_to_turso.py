@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
+import sqlite3
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -17,80 +20,136 @@ def _load_sync_module():
     return module
 
 
-class _FakeStdin:
-    def __init__(self, *, fail_on_write: bool = False) -> None:
-        self._fail_on_write = bool(fail_on_write)
-        self.writes: list[str] = []
-        self.closed = False
-
-    def write(self, data: str) -> int:
-        if self._fail_on_write:
-            raise BrokenPipeError("simulated broken pipe")
-        self.writes.append(str(data))
-        return len(data)
-
-    def flush(self) -> None:
-        return None
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _FakeProcess:
-    def __init__(self, *, fail_on_write: bool = False, exited: bool = False) -> None:
-        self.stdin = _FakeStdin(fail_on_write=fail_on_write)
-        self._exited = bool(exited)
-        self.returncode = 1 if exited else None
-
-    def poll(self) -> int | None:
-        return self.returncode if self._exited else None
-
-    def wait(self, _timeout: float | None = None) -> int:
-        if self.returncode is None:
-            self.returncode = 0
-        return int(self.returncode)
-
-    def terminate(self) -> None:
-        self._exited = True
-        self.returncode = 143
-
-
-class TursoShellSessionTests(unittest.TestCase):
-    def test_reuses_single_process_for_multiple_execute(self) -> None:
+class LibsqlSessionTests(unittest.TestCase):
+    def test_execute_calls_execute_and_commit(self) -> None:
         module = _load_sync_module()
-        fake_proc = _FakeProcess()
-        with patch.object(module.subprocess, "Popen", return_value=fake_proc) as popen:
-            with module.TursoShellSession(
-                turso_db="demo-db",
-                shell_cmd=None,
-                reconnect_attempts=1,
-            ) as session:
-                session.execute("BEGIN; SELECT 1; COMMIT;\n")
-                session.execute("BEGIN; SELECT 2; COMMIT;\n")
+        session_mod = module.session_lib
 
-        self.assertEqual(popen.call_count, 1)
-        self.assertIn("BEGIN; SELECT 1; COMMIT;\n", fake_proc.stdin.writes)
-        self.assertIn("BEGIN; SELECT 2; COMMIT;\n", fake_proc.stdin.writes)
+        calls: dict[str, list[str]] = {"execute": [], "commit": [], "close": []}
 
-    def test_reconnects_once_and_retries_current_sql(self) -> None:
+        class _FakeConn:
+            def execute(self, sql_text: str) -> None:
+                calls["execute"].append(sql_text)
+
+            def commit(self) -> None:
+                calls["commit"].append("1")
+
+            def close(self) -> None:
+                calls["close"].append("1")
+
+        fake_conn = _FakeConn()
+        connect_calls: list[tuple[object, ...]] = []
+
+        class _FakeLibsql:
+            @staticmethod
+            def connect(*args, **kwargs):
+                connect_calls.append((*args, kwargs))
+                return fake_conn
+
+        with patch.object(session_mod, "libsql", _FakeLibsql):
+            session = session_mod.LibsqlSession(
+                url="libsql://demo.turso.io",
+                auth_token="t",
+                timeout_sec=3,
+            )
+            with session:
+                session.execute("SELECT 1;")
+                session.execute("SELECT 2;")
+
+        self.assertEqual(len(connect_calls), 1)
+        self.assertEqual(calls["execute"], ["SELECT 1;", "SELECT 2;"])
+        self.assertEqual(len(calls["commit"]), 2)
+        self.assertEqual(len(calls["close"]), 1)
+
+
+class MainEnvValidationTests(unittest.TestCase):
+    def test_missing_env_exits_with_key_names(self) -> None:
         module = _load_sync_module()
-        failed_proc = _FakeProcess(fail_on_write=True, exited=True)
-        ok_proc = _FakeProcess()
-        with patch.object(
-            module.subprocess, "Popen", side_effect=[failed_proc, ok_proc]
-        ) as popen:
-            with module.TursoShellSession(
-                turso_db="demo-db",
-                shell_cmd=None,
-                reconnect_attempts=1,
-            ) as session:
-                session.execute("BEGIN; INSERT INTO t VALUES (1); COMMIT;\n")
 
-        self.assertEqual(popen.call_count, 2)
-        self.assertIn(
-            "BEGIN; INSERT INTO t VALUES (1); COMMIT;\n",
-            ok_proc.stdin.writes,
-        )
+        argv = [
+            "sync_to_turso.py",
+            "--db",
+            "does-not-matter.sqlite3",
+            "--turso-db",
+            "xueqiu",
+            "--full",
+        ]
+        with (
+            patch("sys.argv", argv),
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(module, "_load_dotenv"),
+            self.assertRaises(SystemExit) as ctx,
+        ):
+            module.main()
+
+        msg = str(ctx.exception)
+        self.assertIn("XUEQIU_TURSO_DATABASE_URL", msg)
+        self.assertIn("XUEQIU_TURSO_AUTH_TOKEN", msg)
+
+
+class MainMetaUpdateTests(unittest.TestCase):
+    def test_full_sync_does_not_set_meta_when_close_fails(self) -> None:
+        module = _load_sync_module()
+        with tempfile.NamedTemporaryFile(suffix=".sqlite3") as tmp:
+            db_path = Path(tmp.name)
+            conn = sqlite3.connect(str(db_path))
+            conn.execute(
+                """
+                CREATE TABLE raw_records (
+                  fetched_at_bj TEXT,
+                  value TEXT
+                )
+                """
+            )
+            conn.execute(
+                "INSERT INTO raw_records(fetched_at_bj, value) VALUES(?, ?)",
+                ("2026-01-01T00:00:00+08:00", "v1"),
+            )
+            conn.commit()
+            conn.close()
+
+            class _FailCloseSession:
+                def __init__(self, *_args, **_kwargs) -> None:
+                    return None
+
+                def __enter__(self) -> "_FailCloseSession":
+                    return self
+
+                def __exit__(self, exc_type, _exc, _tb) -> None:
+                    self.close(raise_on_error=exc_type is None)
+
+                def execute(self, _sql_text: str) -> None:
+                    return None
+
+                def close(self, *, raise_on_error: bool = True) -> None:
+                    if raise_on_error:
+                        raise RuntimeError("close failed")
+
+            argv = [
+                "sync_to_turso.py",
+                "--db",
+                str(db_path),
+                "--turso-db",
+                "demo-db",
+                "--full",
+                "--include",
+                "raw_records",
+            ]
+            env = {
+                "DEMO_DB_TURSO_DATABASE_URL": "libsql://demo.turso.io",
+                "DEMO_DB_TURSO_AUTH_TOKEN": "t",
+            }
+            with (
+                patch("sys.argv", argv),
+                patch.dict(os.environ, env, clear=True),
+                patch.object(module, "_load_dotenv"),
+                patch.object(module.session_lib, "LibsqlSession", _FailCloseSession),
+                patch.object(module.sync_lib, "_set_meta") as set_meta,
+                self.assertRaises(RuntimeError),
+            ):
+                module.main()
+
+            set_meta.assert_not_called()
 
 
 if __name__ == "__main__":
