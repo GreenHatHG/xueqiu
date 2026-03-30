@@ -23,6 +23,7 @@ STANDARD_POSTS_COLUMNS = [
 ]
 
 STANDARD_ASSERTIONS_COLUMNS = [
+    "id",
     "post_uid",
     "idx",
     "topic_key",
@@ -55,6 +56,7 @@ POSTS_STANDARD_SELECT_COLUMNS = [
 ]
 
 ASSERTIONS_STANDARD_SELECT_COLUMNS = [
+    "id",
     "post_uid",
     "idx",
     "topic_key",
@@ -90,6 +92,7 @@ CREATE TABLE IF NOT EXISTS posts (
 
 STANDARD_ASSERTIONS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS assertions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
   post_uid TEXT,
   idx INTEGER,
   topic_key TEXT,

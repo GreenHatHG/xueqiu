@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import sqlite3
 import tempfile
@@ -150,6 +151,183 @@ class MainMetaUpdateTests(unittest.TestCase):
                 module.main()
 
             set_meta.assert_not_called()
+
+
+class AssertionsIdColumnSyncTests(unittest.TestCase):
+    def _create_assertions_table(
+        self, conn: sqlite3.Connection, *, with_id: bool
+    ) -> None:
+        if with_id:
+            conn.execute(
+                """
+                CREATE TABLE assertions (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  post_uid TEXT,
+                  idx INTEGER,
+                  topic_key TEXT,
+                  action TEXT,
+                  action_strength INTEGER,
+                  summary TEXT,
+                  evidence TEXT,
+                  confidence REAL,
+                  stock_codes_json TEXT,
+                  stock_names_json TEXT,
+                  industries_json TEXT,
+                  commodities_json TEXT,
+                  indices_json TEXT,
+                  created_at TEXT,
+                  UNIQUE(post_uid, idx)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO assertions(
+                  post_uid,
+                  idx,
+                  topic_key,
+                  action,
+                  action_strength,
+                  summary,
+                  evidence,
+                  confidence,
+                  stock_codes_json,
+                  stock_names_json,
+                  industries_json,
+                  commodities_json,
+                  indices_json,
+                  created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "p1",
+                    1,
+                    "topic",
+                    "buy",
+                    1,
+                    "s",
+                    "e",
+                    0.8,
+                    "[]",
+                    "[]",
+                    "[]",
+                    "[]",
+                    "[]",
+                    "2026-01-01T00:00:00+08:00",
+                ),
+            )
+            conn.commit()
+            return
+
+        conn.execute(
+            """
+            CREATE TABLE assertions (
+              post_uid TEXT,
+              idx INTEGER,
+              topic_key TEXT,
+              action TEXT,
+              action_strength INTEGER,
+              summary TEXT,
+              evidence TEXT,
+              confidence REAL,
+              stock_codes_json TEXT,
+              stock_names_json TEXT,
+              industries_json TEXT,
+              commodities_json TEXT,
+              indices_json TEXT,
+              created_at TEXT,
+              UNIQUE(post_uid, idx)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO assertions(
+              post_uid,
+              idx,
+              topic_key,
+              action,
+              action_strength,
+              summary,
+              evidence,
+              confidence,
+              stock_codes_json,
+              stock_names_json,
+              industries_json,
+              commodities_json,
+              indices_json,
+              created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "p1",
+                1,
+                "topic",
+                "buy",
+                1,
+                "s",
+                "e",
+                0.8,
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "2026-01-01T00:00:00+08:00",
+            ),
+        )
+        conn.commit()
+
+    def test_full_sync_assertions_without_id_column_raises(self) -> None:
+        module = _load_sync_module()
+        with tempfile.NamedTemporaryFile(suffix=".sqlite3") as tmp:
+            db_path = Path(tmp.name)
+            conn = sqlite3.connect(str(db_path))
+            self._create_assertions_table(conn, with_id=False)
+            conn.close()
+
+            with (
+                patch("sys.stdout", new=io.StringIO()),
+                self.assertRaises(sqlite3.OperationalError) as ctx,
+            ):
+                module.sync_lib.sync_sqlite_to_turso(
+                    db_path=db_path,
+                    full=True,
+                    incremental=False,
+                    batch_size=100,
+                    include=["assertions"],
+                    exclude=[],
+                    dry_run=True,
+                    progress=False,
+                    session=None,
+                )
+        self.assertIn("no such column: id", str(ctx.exception))
+
+    def test_full_sync_assertions_with_id_column_includes_id_insert(self) -> None:
+        module = _load_sync_module()
+        with tempfile.NamedTemporaryFile(suffix=".sqlite3") as tmp:
+            db_path = Path(tmp.name)
+            conn = sqlite3.connect(str(db_path))
+            self._create_assertions_table(conn, with_id=True)
+            conn.close()
+
+            captured = io.StringIO()
+            with patch("sys.stdout", new=captured):
+                module.sync_lib.sync_sqlite_to_turso(
+                    db_path=db_path,
+                    full=True,
+                    incremental=False,
+                    batch_size=100,
+                    include=["assertions"],
+                    exclude=[],
+                    dry_run=True,
+                    progress=False,
+                    session=None,
+                )
+        self.assertIn(
+            'INSERT OR REPLACE INTO "assertions" ("id", "post_uid", "idx"',
+            captured.getvalue(),
+        )
 
 
 if __name__ == "__main__":
