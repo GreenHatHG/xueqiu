@@ -41,6 +41,7 @@ from .storage import (
 )
 from .text_sanitize import (
     strip_reply_wrappers,
+    split_reply_chain_for_rss,
 )
 
 
@@ -210,21 +211,55 @@ def _rss_raw_text(text: str) -> str:
 
         if "：" in s:
             speaker, body = s.split("：", 1)
+            lines = split_reply_chain_for_rss(speaker=speaker, body=body)
+        else:
+            lines = split_reply_chain_for_rss(speaker="", body=s)
+        lines = lines if lines else [s]
+
+        overlap = 0
+        max_overlap = min(len(out), len(lines))
+        for size in range(max_overlap, 0, -1):
+            if out[-size:] == lines[:size]:
+                overlap = size
+                break
+        out.extend(lines[overlap:])
+
+    return TALK_TEXT_SEPARATOR.join([part for part in out if str(part).strip()])
+
+
+def _rss_title_text(text: str) -> str:
+    """
+    Keep title semantics stable: use the current reply wording, not newly promoted
+    older quoted lines.
+    """
+
+    parts = [str(part).strip() for part in str(text or "").split(TALK_TEXT_SEPARATOR)]
+    parts = [part for part in parts if part]
+    if not parts:
+        return ""
+
+    for part in reversed(parts):
+        s = str(part or "").strip()
+        if not s:
+            continue
+
+        if "：" in s:
+            speaker, body = s.split("：", 1)
             speaker_text = str(speaker or "").strip()
             body_text = str(body or "")
             stripped_body = strip_reply_wrappers(body_text)
-            # Follow raw_text semantics: only use stripped result when it's non-empty.
             final_body = stripped_body if stripped_body else body_text.strip()
             if speaker_text and final_body:
-                out.append(f"{speaker_text}：{final_body}")
-            else:
-                out.append(stripped_body or s)
+                return f"{speaker_text}：{final_body}"
+            if stripped_body or s:
+                return stripped_body or s
             continue
 
         stripped = strip_reply_wrappers(s)
-        out.append(stripped if stripped else s)
+        if stripped or s:
+            return stripped if stripped else s
 
-    return TALK_TEXT_SEPARATOR.join([part for part in out if str(part).strip()])
+    return ""
 
 
 def _parse_entry_context(context_json: Any) -> dict[str, Any]:
@@ -337,9 +372,10 @@ def _query_latest_entries(*, db: SqliteDb, user_id: str, limit: int) -> list[Rss
     for row in cur:
         merge_key = str(row["merge_key"] or "").strip()
         author = str(row["username"] or "").strip()
-        text = _rss_raw_text(str(row["text"] or ""))
+        raw_text = str(row["text"] or "")
+        text = _rss_raw_text(raw_text)
         ctx = _parse_entry_context(row["context_json"])
-        title = _pick_title(text)
+        title = _pick_title(_rss_title_text(raw_text))
         link = _build_entry_link(user_id=str(user_id), ctx=ctx)
         post_uid = _post_uid_from_entry(merge_key=merge_key, ctx=ctx)
         pub_date = _to_rfc2822(row["created_at_bj"])

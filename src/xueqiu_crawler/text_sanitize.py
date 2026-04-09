@@ -106,3 +106,61 @@ def strip_reply_wrappers(text: Any) -> str:
     cleaned = _RE_REPLY_WRAPPER_PREFIX.sub("", cleaned)
     cleaned = _RE_FORWARD_SUFFIX.sub("", cleaned)
     return cleaned.strip()
+
+
+def _split_forward_tail(text: str) -> tuple[str, str, str]:
+    body = str(text or "")
+    marker = body.find("//@")
+    if marker < 0:
+        return body, "", ""
+
+    current_body = body[:marker].rstrip()
+    tail = body[marker + 3 :].strip()
+    if not tail:
+        return body, "", ""
+
+    speaker = ""
+    quoted_body = ""
+    for sep in ("：", ":"):
+        if sep not in tail:
+            continue
+        candidate_speaker, candidate_body = tail.split(sep, 1)
+        candidate_speaker = str(candidate_speaker or "").strip()
+        if not candidate_speaker:
+            continue
+        speaker = candidate_speaker
+        quoted_body = str(candidate_body or "")
+        break
+
+    if not speaker:
+        return body, "", ""
+    return current_body, speaker, quoted_body
+
+
+def split_reply_chain_for_rss(*, speaker: Any, body: Any) -> list[str]:
+    """
+    Convert a Xueqiu reply body into ordered RSS lines.
+
+    Example:
+    - speaker="A", body="回复@B: 现在的话 //@B:回复@A:上一句"
+    - output=["B：上一句", "A：现在的话"]
+    """
+
+    def _walk(line_speaker: str, line_body: str) -> list[str]:
+        current_body, quoted_speaker, quoted_body = _split_forward_tail(line_body)
+        out: list[str] = []
+        if quoted_speaker:
+            out.extend(_walk(quoted_speaker, quoted_body))
+
+        final_body = strip_reply_wrappers(current_body)
+        if not final_body:
+            final_body = str(current_body or "").strip()
+        if not final_body:
+            return out
+        if line_speaker:
+            out.append(f"{line_speaker}：{final_body}")
+        else:
+            out.append(final_body)
+        return out
+
+    return _walk(str(speaker or "").strip(), str(body or "").strip())
