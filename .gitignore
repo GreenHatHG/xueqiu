@@ -6,6 +6,7 @@ storage_state.json
 **/__pycache__/
 .pytest_cache/
 .venv/
+.pre-commit-cache/
 .DS_Store
 .env
 .vscode

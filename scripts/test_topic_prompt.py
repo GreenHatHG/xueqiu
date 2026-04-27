@@ -23,6 +23,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from xueqiu_crawler.constants import BASE_URL
 from xueqiu_crawler.text_sanitize import sanitize_xueqiu_text, strip_reply_wrappers
 
 MERGED_TABLE_NAME = "merged_records"
@@ -31,6 +32,9 @@ POSTS_TABLE_NAME = "posts"
 TOPIC_RUN_PROGRESS_TABLE_NAME = "topic_package_run_progress"
 USERNAME_COLUMN_NAME = "username"
 ROOT_STATUS_URL_FIELD_NAME = "root_status_url"
+ROOT_STATUS_ID_FIELD_NAME = "root_status_id"
+STATUS_URL_FIELD_NAME = "status_url"
+USER_ID_FIELD_NAME = "user_id"
 JSON_ARRAY_EMPTY = "[]"
 ASSERTION_UID_PREFIX = "xueqiu:assertion"
 ASSERTION_UID_COLUMN_NAME = "assertion_uid"
@@ -65,6 +69,8 @@ COVERAGE_IGNORED_SKIP_REASONS = frozenset({"skip_image_only_status"})
 TRUNCATED_TEXT_SUFFIXES = ("...", "……", "…")
 TRUNCATION_RECOVERY_MIN_SNIPPET_CHARS = 24
 TRUNCATION_RECOVERY_MIN_GAIN_CHARS = 24
+STATUS_SOURCE_KINDS = frozenset({"status", "topic_post"})
+COMMENT_SOURCE_KINDS = frozenset({"comment", "talk_reply"})
 
 _RE_HTML_TAG = re.compile(r"<[^>]+>")
 _RE_ANSI_ESCAPE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
@@ -634,6 +640,7 @@ def _build_root_status_hint(
     talk_context: list[dict[str, str]],
     topic_status_id: str,
     root_status_id: str,
+    root_status_url: str,
     fallback_created_at: str,
 ) -> Optional[dict[str, str]]:
     if not root_status_id or root_status_id == topic_status_id:
@@ -652,7 +659,7 @@ def _build_root_status_hint(
     if not text:
         return None
 
-    return {
+    out = {
         "source_kind": "status",
         "source_id": root_status_id,
         "speaker": speaker,
@@ -660,6 +667,11 @@ def _build_root_status_hint(
         "text": text,
         "display_text": root_line,
     }
+    root_status_url_text = str(root_status_url or "").strip()
+    if root_status_url_text:
+        out[ROOT_STATUS_ID_FIELD_NAME] = root_status_id
+        out[ROOT_STATUS_URL_FIELD_NAME] = root_status_url_text
+    return out
 
 
 def _build_reply_parent_hint(
@@ -770,6 +782,8 @@ def _build_status_message(
         "text": text,
         "display_text": display_text,
         "topic_status_id": str(context_obj.get("topic_status_id") or "").strip(),
+        STATUS_URL_FIELD_NAME: _normalize_text(context_obj.get(STATUS_URL_FIELD_NAME)),
+        USER_ID_FIELD_NAME: _normalize_text(record.get(USER_ID_FIELD_NAME)),
     }
 
 
@@ -913,6 +927,7 @@ def _build_comment_message(
         talk_context=message["talk_context"],
         topic_status_id=topic_status_id,
         root_status_id=message["root_status_id"],
+        root_status_url=root_status_url,
         fallback_created_at=created_at,
     )
     message["reply_parent_hint"] = _build_reply_parent_hint(
@@ -932,6 +947,8 @@ def _build_comment_message(
                 "created_at": created_at,
                 "text": topic_text,
                 "display_text": lines[0],
+                ROOT_STATUS_ID_FIELD_NAME: message["root_status_id"],
+                ROOT_STATUS_URL_FIELD_NAME: root_status_url,
             }
     return message
 
@@ -1315,6 +1332,15 @@ def _build_internal_message_payload(
     root_status_url = str(message.get(ROOT_STATUS_URL_FIELD_NAME) or "").strip()
     if root_status_url:
         payload[ROOT_STATUS_URL_FIELD_NAME] = root_status_url
+    root_status_id = str(message.get(ROOT_STATUS_ID_FIELD_NAME) or "").strip()
+    if root_status_id:
+        payload[ROOT_STATUS_ID_FIELD_NAME] = root_status_id
+    status_url = str(message.get(STATUS_URL_FIELD_NAME) or "").strip()
+    if status_url:
+        payload[STATUS_URL_FIELD_NAME] = status_url
+    user_id = str(message.get(USER_ID_FIELD_NAME) or "").strip()
+    if user_id:
+        payload[USER_ID_FIELD_NAME] = user_id
     return payload
 
 
@@ -2690,14 +2716,39 @@ def _build_assertions_preview(
     return rows
 
 
+def _build_status_detail_url(*, user_id: str, status_id: str) -> str:
+    uid = _normalize_text(user_id)
+    sid = _normalize_text(status_id)
+    if not uid or not sid:
+        return ""
+    return f"{BASE_URL}/{uid}/{sid}"
+
+
+def _status_url_from_message(message: dict[str, Any]) -> str:
+    direct_url = _normalize_text(message.get(STATUS_URL_FIELD_NAME))
+    if direct_url:
+        return direct_url
+
+    source_id = _normalize_text(message.get("source_id"))
+    root_status_id = _normalize_text(message.get(ROOT_STATUS_ID_FIELD_NAME))
+    root_status_url = _normalize_text(message.get(ROOT_STATUS_URL_FIELD_NAME))
+    if source_id and root_status_id and source_id == root_status_id and root_status_url:
+        return root_status_url
+
+    return _build_status_detail_url(
+        user_id=_normalize_text(message.get(USER_ID_FIELD_NAME)),
+        status_id=source_id,
+    )
+
+
 def _source_url_from_message(message: dict[str, Any]) -> str:
     source_kind = _normalize_text(message.get("source_kind"))
     source_id = _normalize_text(message.get("source_id"))
     if not source_kind or not source_id:
         return ""
-    if source_kind in {"status", "topic_post"}:
-        return f"https://xueqiu.com/S/{source_id}"
-    if source_kind in {"comment", "talk_reply"}:
+    if source_kind in STATUS_SOURCE_KINDS:
+        return _status_url_from_message(message)
+    if source_kind in COMMENT_SOURCE_KINDS:
         return _normalize_text(message.get(ROOT_STATUS_URL_FIELD_NAME))
     return ""
 

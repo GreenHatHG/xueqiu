@@ -38,7 +38,7 @@ ignore_missing_imports = true
 
 [tool.vulture]
 paths = ["."]
-exclude = ["venv", ".venv", ".uv-cache"]
+exclude = ["venv", ".venv", ".uv-cache", ".pre-commit-cache"]
 sort_by_size = true
 ignore_names = [
   "pytest_configure",

@@ -38,6 +38,8 @@ from .storage import (
     TALK_TEXT_SEPARATOR,
     SqliteCrawlProgressStore,
     SqliteDb,
+    _comment_root_url,
+    _status_url_from_record,
 )
 from .text_sanitize import (
     strip_reply_wrappers,
@@ -279,6 +281,101 @@ def _parse_entry_context(context_json: Any) -> dict[str, Any]:
     return obj if isinstance(obj, dict) else {}
 
 
+def _parse_entry_payload(payload_json: Any) -> dict[str, Any]:
+    if isinstance(payload_json, dict):
+        return payload_json
+    if not isinstance(payload_json, str):
+        return {}
+    text = payload_json.strip()
+    if not text:
+        return {}
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _is_legacy_entry_url(url: str) -> bool:
+    text = str(url or "").strip()
+    if not text:
+        return False
+    if text.startswith(f"{BASE_URL}/status/"):
+        return True
+    if not text.startswith(f"{BASE_URL}/S/"):
+        return False
+    tail = text[len(f"{BASE_URL}/S/") :]
+    return bool(tail) and "/" not in tail and tail.isdigit()
+
+
+def _normalize_entry_context_for_link(
+    *, ctx: dict[str, Any], payload_json: Any
+) -> dict[str, Any]:
+    payload = _parse_entry_payload(payload_json)
+    out = dict(ctx)
+    entry_type = str(out.get("entry_type") or "").strip()
+
+    if entry_type == "status":
+        current_status_url = str(out.get("status_url") or "").strip()
+        if current_status_url and not _is_legacy_entry_url(current_status_url):
+            return out
+        status_payload = payload.get("status")
+        record = (
+            status_payload.get("record")
+            if isinstance(status_payload, dict)
+            and isinstance(status_payload.get("record"), dict)
+            else {}
+        )
+        if record:
+            status_url = _status_url_from_record(record)
+            if not status_url:
+                status_user_id = str(record.get("user_id") or "").strip()
+                status_id = str(
+                    record.get("status_id") or out.get("status_id") or ""
+                ).strip()
+                if status_user_id and status_id:
+                    status_url = f"{BASE_URL}/{status_user_id}/{status_id}"
+            if status_url:
+                out["status_url"] = status_url
+        return out
+
+    if entry_type != "chain":
+        return out
+
+    current_root_url = str(out.get("root_status_url") or "").strip()
+    if current_root_url and not _is_legacy_entry_url(current_root_url):
+        return out
+
+    comment_payload = payload.get("comment")
+    record = (
+        comment_payload.get("record")
+        if isinstance(comment_payload, dict)
+        and isinstance(comment_payload.get("record"), dict)
+        else {}
+    )
+    if not record:
+        return out
+
+    root_status_url = _comment_root_url(record)
+    if root_status_url:
+        out["root_status_url"] = root_status_url
+
+    root_status_user_id = str(record.get("root_status_user_id") or "").strip()
+    if root_status_user_id and not str(out.get("root_status_user_id") or "").strip():
+        out["root_status_user_id"] = root_status_user_id
+
+    root_status_target = str(record.get("root_status_target") or "").strip()
+    if root_status_target and not str(out.get("root_status_target") or "").strip():
+        out["root_status_target"] = root_status_target
+
+    root_status_id = str(
+        record.get("root_status_id") or record.get("root_in_reply_to_status_id") or ""
+    ).strip()
+    if root_status_id and not str(out.get("root_status_id") or "").strip():
+        out["root_status_id"] = root_status_id
+    return out
+
+
 def _build_post_uid(*, source_kind: str, source_id: str) -> str:
     kind = str(source_kind or "").strip()
     sid = str(source_id or "").strip()
@@ -329,17 +426,23 @@ def _build_entry_link(*, user_id: str, ctx: dict[str, Any]) -> str:
         root_url = str(ctx.get("root_status_url") or "").strip()
         if root_url:
             return root_url
+        root_target = str(ctx.get("root_status_target") or "").strip()
+        if root_target.startswith("/"):
+            return f"{BASE_URL}{root_target}"
         root_status_id = str(ctx.get("root_status_id") or "").strip()
-        if root_status_id:
-            return f"{BASE_URL}/status/{root_status_id}"
+        root_status_user_id = str(ctx.get("root_status_user_id") or "").strip()
+        if root_status_user_id and root_status_id:
+            return f"{BASE_URL}/{root_status_user_id}/{root_status_id}"
         return f"{BASE_URL}/u/{str(user_id).strip()}"
     # status
+    status_url = str(ctx.get("status_url") or "").strip()
+    if status_url:
+        return status_url
     status_id = str(ctx.get("status_id") or "").strip()
     if status_id:
         uid = str(user_id or "").strip()
         if uid:
             return f"{BASE_URL}/{uid}/{status_id}"
-        return f"{BASE_URL}/status/{status_id}"
     return f"{BASE_URL}/u/{str(user_id).strip()}"
 
 
@@ -359,7 +462,7 @@ def _to_rfc2822(value: Any) -> str:
 def _query_latest_entries(*, db: SqliteDb, user_id: str, limit: int) -> list[RssEntry]:
     cur = db.conn.execute(
         f"""
-        SELECT merge_key, username, created_at_bj, text, context_json
+        SELECT merge_key, username, created_at_bj, text, context_json, payload_json
         FROM {MERGED_TABLE_NAME}
         WHERE user_id = ?
           AND merge_key LIKE 'entry:%'
@@ -374,7 +477,10 @@ def _query_latest_entries(*, db: SqliteDb, user_id: str, limit: int) -> list[Rss
         author = str(row["username"] or "").strip()
         raw_text = str(row["text"] or "")
         text = _rss_raw_text(raw_text)
-        ctx = _parse_entry_context(row["context_json"])
+        ctx = _normalize_entry_context_for_link(
+            ctx=_parse_entry_context(row["context_json"]),
+            payload_json=row["payload_json"],
+        )
         title = _pick_title(_rss_title_text(raw_text))
         link = _build_entry_link(user_id=str(user_id), ctx=ctx)
         post_uid = _post_uid_from_entry(merge_key=merge_key, ctx=ctx)

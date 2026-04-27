@@ -181,12 +181,17 @@ def _context_json_for_comment(record: dict[str, Any]) -> str:
 
 
 def _context_json_for_talk(
-    *, root_status_id: str, comment_id: str, root_status_url: str
+    *,
+    root_status_id: str,
+    comment_id: str,
+    root_status_url: str,
+    root_status_user_id: str = "",
 ) -> str:
     ctx = {
         "root_status_id": str(root_status_id),
         "comment_id": str(comment_id),
         "root_status_url": str(root_status_url or ""),
+        "root_status_user_id": str(root_status_user_id or ""),
     }
     return json.dumps(ctx, ensure_ascii=False)
 
@@ -336,14 +341,20 @@ def _comment_root_url(record: dict[str, Any]) -> str:
     url = record.get("root_status_url")
     if url:
         return str(url).strip()
-    root_status_id = record.get("root_in_reply_to_status_id") or record.get(
-        "root_status_id"
-    )
-    if root_status_id:
-        return f"{BASE_URL}/status/{str(root_status_id).strip()}"
     target = record.get("root_status_target")
     if isinstance(target, str) and target.startswith("/"):
         return f"{BASE_URL}{target}"
+    root_status_user_id = record.get("root_status_user_id")
+    root_status_id = record.get("root_in_reply_to_status_id") or record.get(
+        "root_status_id"
+    )
+    if root_status_user_id not in (None, "", 0, "0") and root_status_id not in (
+        None,
+        "",
+        0,
+        "0",
+    ):
+        return f"{BASE_URL}/{str(root_status_user_id).strip()}/{str(root_status_id).strip()}"
     return ""
 
 
@@ -871,6 +882,12 @@ def _build_user_entries(
                             or ""
                         ),
                         "root_status_url": _comment_root_url(record),
+                        "root_status_user_id": str(
+                            record.get("root_status_user_id") or ""
+                        ),
+                        "root_status_target": str(
+                            record.get("root_status_target") or ""
+                        ),
                     },
                 ),
                 "payload_json": json.dumps(
@@ -936,6 +953,7 @@ def _build_user_entries(
                         "status_id": str(status_id),
                         "topic_status_id": str(topic_status_id or status_id),
                         "comment_id": comment_id,
+                        "status_url": _status_url_from_record(record),
                     },
                 ),
                 "payload_json": json.dumps(
@@ -1348,7 +1366,8 @@ class SqliteMergedTalksStore:
         chain = _talk_chain_text_from_clean_obj(clean_obj)
 
         root_line = ""
-        root_status_url = f"{BASE_URL}/status/{str(root_status_id).strip()}"
+        root_status_url = ""
+        root_status_user_id = ""
         try:
             row = self.db.conn.execute(
                 f"SELECT payload_json FROM {self.table_name} WHERE merge_key = ? AND user_id = ?",
@@ -1361,6 +1380,9 @@ class SqliteMergedTalksStore:
                     if isinstance(rec, dict):
                         root_line = _root_status_display_line_from_comment_record(rec)
                         root_status_url = _comment_root_url(rec) or root_status_url
+                        root_status_user_id = str(
+                            rec.get("root_status_user_id") or ""
+                        ).strip()
         except Exception:
             pass
 
@@ -1375,6 +1397,7 @@ class SqliteMergedTalksStore:
             root_status_id=str(root_status_id),
             comment_id=str(comment_id),
             root_status_url=str(root_status_url),
+            root_status_user_id=str(root_status_user_id),
         )
         self.db.conn.execute(
             f"""
