@@ -210,7 +210,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help=(
             "抓取内容范围："
             "core=浏览器会话抓取（发言+回复+查看对话）；"
-            "incremental_http=无浏览器增量抓取（需要环境变量 XUEQIU_COOKIE；timeline/comments 只抓一页，但 talks/detail 尽量补齐）。"
+            "incremental_http=无浏览器增量抓取（可选环境变量 XUEQIU_COOKIE；timeline/comments 只抓一页，但 talks/detail 尽量补齐）。"
         ),
     )
     p.add_argument(
@@ -2021,7 +2021,7 @@ def _run_single_user(
             user_id=str(user_id),
             since_bj=since_bj,
             url=_profile_url(str(user_id)),
-            url_contains="/v4/statuses/user_timeline.json",
+            url_contains="/statuses/user_timeline.json",
             max_batches=int(args.max_timeline_pages),
             store=timeline_store,
             seen_ids=seen_status_ids,

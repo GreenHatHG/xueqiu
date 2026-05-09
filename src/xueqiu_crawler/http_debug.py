@@ -15,6 +15,7 @@ DEBUG_SENSITIVE_QUERY_KEYS = frozenset(
         "authorization",
         "cookie",
         "key",
+        "md5__1038",
         "signature",
         "token",
         "xq_a_token",
