@@ -125,6 +125,7 @@ def main() -> int:
         referrer=str(args.referrer or "").strip() or None,
     )
 
+    trace_id = str(getattr(api, "_last_trace_id", "") or "")
     generated_md5 = _extract_query_value(final_url, MD5_QUERY_KEY)
     last_signed_url = str(getattr(api, "_last_waf_signed_url", "") or "")
     last_generated_md5 = _extract_query_value(last_signed_url, MD5_QUERY_KEY)
@@ -156,6 +157,7 @@ def main() -> int:
     body_head = str(text or "")[: max(0, int(args.body_head_chars))].replace("\n", " ")
     print(f"original_url = {url}")
     print(f"unsigned_url = {unsigned_url}")
+    print(f"trace_id = {trace_id}")
     print(f"final_url = {final_url}")
     print(f"status = {int(status)}")
     print(f"original_md5 = {original_md5}")

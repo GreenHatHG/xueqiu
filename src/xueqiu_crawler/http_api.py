@@ -51,10 +51,18 @@ DEFAULT_COOKIE_DOMAIN = ".xueqiu.com"
 DEFAULT_COOKIE_PATH = "/"
 WAF_SIGN_PATHS = frozenset(("/statuses/show.json", "/v5/statuses/show.json"))
 WAF_SIGN_CACHE_TTL_SEC = 10 * 60.0
+HTTP_TRACE_ID_PREFIX = "xq-http"
+HTTP_TRACE_ID_RANDOM_BYTES = 4
 
 
 def _cookie_from_env() -> str:
     return str(os.environ.get(XUEQIU_COOKIE_ENV, "") or "").strip()
+
+
+def _build_http_trace_id() -> str:
+    timestamp_ms = int(time.time() * 1000)
+    random_suffix = os.urandom(HTTP_TRACE_ID_RANDOM_BYTES).hex()
+    return f"{HTTP_TRACE_ID_PREFIX}-{timestamp_ms}-{random_suffix}"
 
 
 @dataclass(frozen=True)
@@ -287,6 +295,8 @@ class XueqiuHttpApi:
         self._last_waf_signed_cookie_writes = 0
         self._last_waf_round = 0
         self._last_waf_cache_hit = False
+        self._current_trace_id = ""
+        self._last_trace_id = ""
 
     @classmethod
     def from_env(cls, cfg: ApiConfig) -> "XueqiuHttpApi":
@@ -295,9 +305,27 @@ class XueqiuHttpApi:
     def _http_debug_enabled(self) -> bool:
         return bool(getattr(self._cfg, "http_debug", False))
 
-    def _http_debug_log(self, message: str) -> None:
+    def _http_debug_log(self, message: str, *, trace_id: Optional[str] = None) -> None:
         if self._http_debug_enabled():
-            print(f"[http-debug] {message}", file=sys.stderr)
+            active_trace_id = str(trace_id or self._current_trace_id or "").strip()
+            prefix = (
+                f"[http-debug] trace_id={active_trace_id} "
+                if active_trace_id
+                else "[http-debug] "
+            )
+            print(f"{prefix}{message}", file=sys.stderr)
+
+    def _push_trace_id(self, trace_id: Optional[str] = None) -> str:
+        previous_trace_id = str(self._current_trace_id or "").strip()
+        active_trace_id = (
+            str(trace_id or "").strip() or previous_trace_id or _build_http_trace_id()
+        )
+        self._current_trace_id = active_trace_id
+        self._last_trace_id = active_trace_id
+        return previous_trace_id
+
+    def _pop_trace_id(self, previous_trace_id: str) -> None:
+        self._current_trace_id = str(previous_trace_id or "").strip()
 
     def build_url(self, path: str, params: Optional[dict[str, Any]] = None) -> str:
         p = str(path or "").strip()
@@ -589,50 +617,62 @@ class XueqiuHttpApi:
         return None
 
     def _fetch_text_once(
-        self, url: str, *, referrer: Optional[str] = None
+        self,
+        url: str,
+        *,
+        referrer: Optional[str] = None,
+        trace_id: Optional[str] = None,
     ) -> tuple[int, str, str]:
-        self._limiter.sleep_before_next()
-        self._reset_last_waf_state()
-        target = str(url or "").strip()
-        if not target:
-            return 0, "", ""
-        request_target = (
-            target if target == HQ_WARMUP_URL else strip_md5_query_param(target)
-        )
-        if request_target != HQ_WARMUP_URL:
-            self._ensure_hq_warmup()
-
-        can_sign = self._should_run_waf_signer(request_target)
-        if can_sign:
-            cached_result = self._try_fetch_cached_waf_response(
-                request_target, referrer=referrer
+        previous_trace_id = self._push_trace_id(trace_id)
+        try:
+            self._limiter.sleep_before_next()
+            self._reset_last_waf_state()
+            target = str(url or "").strip()
+            if not target:
+                return 0, "", ""
+            request_target = (
+                target if target == HQ_WARMUP_URL else strip_md5_query_param(target)
             )
-            if cached_result is not None:
-                return (
-                    int(cached_result.status),
-                    str(cached_result.text),
-                    str(cached_result.final_url),
+            if request_target != HQ_WARMUP_URL:
+                self._ensure_hq_warmup()
+
+            can_sign = self._should_run_waf_signer(request_target)
+            if can_sign:
+                cached_result = self._try_fetch_cached_waf_response(
+                    request_target, referrer=referrer
                 )
+                if cached_result is not None:
+                    return (
+                        int(cached_result.status),
+                        str(cached_result.text),
+                        str(cached_result.final_url),
+                    )
 
-        result = self._fetch_raw_once(request_target, referrer=referrer)
-        if can_sign and self._looks_like_waf_response(
-            text=result.text, final_url=result.final_url
-        ):
-            self._http_debug_log(
-                "waf challenge detected "
-                f"url={sanitize_url_for_debug(request_target)} "
-                f"final_url={sanitize_url_for_debug(result.final_url)} "
-                f"status={int(result.status)}"
-            )
-            resolved = self._resolve_waf_challenge(
-                url=request_target,
-                referrer=referrer,
-                challenge_html=result.text,
-            )
-            if resolved is not None:
-                return int(resolved.status), str(resolved.text), str(resolved.final_url)
+            result = self._fetch_raw_once(request_target, referrer=referrer)
+            if can_sign and self._looks_like_waf_response(
+                text=result.text, final_url=result.final_url
+            ):
+                self._http_debug_log(
+                    "waf challenge detected "
+                    f"url={sanitize_url_for_debug(request_target)} "
+                    f"final_url={sanitize_url_for_debug(result.final_url)} "
+                    f"status={int(result.status)}"
+                )
+                resolved = self._resolve_waf_challenge(
+                    url=request_target,
+                    referrer=referrer,
+                    challenge_html=result.text,
+                )
+                if resolved is not None:
+                    return (
+                        int(resolved.status),
+                        str(resolved.text),
+                        str(resolved.final_url),
+                    )
 
-        return int(result.status), str(result.text), str(result.final_url)
+            return int(result.status), str(result.text), str(result.final_url)
+        finally:
+            self._pop_trace_id(previous_trace_id)
 
     @staticmethod
     def _should_run_waf_signer(url: str) -> bool:
@@ -701,137 +741,151 @@ class XueqiuHttpApi:
         last_exc: Optional[Exception] = None
         label = str(request_label or url)
         total_attempts = int(self._cfg.max_retries) + 1
-
-        for attempt in range(total_attempts):
-            attempt_started = time.monotonic()
-            attempt_no = int(attempt) + 1
-            self._http_debug_log(
-                f"{label} attempt={attempt_no}/{total_attempts} request "
-                f"url={sanitize_url_for_debug(url)} "
-                f"referrer={sanitize_url_for_debug(str(referrer or ''))}"
-            )
-            try:
-                status, text, final_url = self._fetch_text_once(url, referrer=referrer)
-
-                looks_html = _looks_like_html(text)
-                elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
+        previous_trace_id = self._push_trace_id()
+        trace_id = str(self._current_trace_id or "").strip()
+        try:
+            for attempt in range(total_attempts):
+                attempt_started = time.monotonic()
+                attempt_no = int(attempt) + 1
                 self._http_debug_log(
-                    f"{label} attempt={attempt_no}/{total_attempts} response "
-                    f"status={int(status)} elapsed_ms={elapsed_ms} body_len={len(text)} "
-                    f"looks_html={int(bool(looks_html))} "
-                    f"final_url={sanitize_url_for_debug(final_url)}"
+                    f"{label} attempt={attempt_no}/{total_attempts} request "
+                    f"url={sanitize_url_for_debug(url)} "
+                    f"referrer={sanitize_url_for_debug(str(referrer or ''))}"
                 )
-                if status in (401, 403, 429):
-                    raise BlockedError(f"blocked or not logged in (status={status})")
-                if looks_html:
-                    is_waf = bool(
-                        ("alichlgref=" in final_url.lower())
-                        or ("md5__1038=" in final_url.lower())
-                        or ("_waf_" in final_url.lower())
-                        or _looks_like_waf_challenge(text)
-                    )
-                    if is_waf:
-                        raise ChallengeRequiredError(
-                            f"waf challenge required (status={status})",
-                            url=url,
-                            final_url=final_url,
-                            status=int(status),
-                            text_head=text[:200],
-                        )
-                    raise BlockedError(f"blocked or not logged in (status={status})")
-
                 try:
-                    obj = json.loads(text)
-                except Exception as e:
-                    preview, truncated, total_len = text_preview(text)
-                    self._http_debug_log(
-                        f"{label} attempt={attempt_no}/{total_attempts} json_parse_failed "
-                        f"status={int(status)} text_len={total_len} "
-                        f"text_head={single_line_text(preview)} truncated={int(truncated)} "
-                        f"error={single_line_text(str(e))}"
+                    status, text, final_url = self._fetch_text_once(
+                        url,
+                        referrer=referrer,
+                        trace_id=trace_id,
                     )
-                    if (
-                        ("alichlgref=" in final_url.lower())
-                        or ("md5__1038=" in final_url.lower())
-                        or ("_waf_" in final_url.lower())
-                        or _looks_like_waf_challenge(text)
-                    ):
-                        raise ChallengeRequiredError(
-                            f"waf challenge required (status={status})",
-                            url=url,
-                            final_url=final_url,
-                            status=int(status),
-                            text_head=text[:200],
-                        ) from e
-                    if _looks_like_html(text):
-                        raise BlockedError(
-                            f"blocked or not logged in (status={status})"
-                        ) from e
-                    raise
 
-                issue = retry_reason(obj) if retry_reason is not None else None
-                if issue is not None:
-                    payload_summary = summarize_payload(obj)
-                    preview, truncated, total_len = text_preview(text)
+                    looks_html = _looks_like_html(text)
+                    elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
                     self._http_debug_log(
-                        f"{label} attempt={attempt_no}/{total_attempts} bad_payload "
-                        f"status={int(status)} issue={single_line_text(str(issue))} "
-                        f"{payload_summary} "
-                        f"url={sanitize_url_for_debug(url)} "
+                        f"{label} attempt={attempt_no}/{total_attempts} response "
+                        f"status={int(status)} elapsed_ms={elapsed_ms} body_len={len(text)} "
+                        f"looks_html={int(bool(looks_html))} "
                         f"final_url={sanitize_url_for_debug(final_url)}"
                     )
+                    if status in (401, 403, 429):
+                        raise BlockedError(
+                            f"blocked or not logged in (status={status})"
+                        )
+                    if looks_html:
+                        is_waf = bool(
+                            ("alichlgref=" in final_url.lower())
+                            or ("md5__1038=" in final_url.lower())
+                            or ("_waf_" in final_url.lower())
+                            or _looks_like_waf_challenge(text)
+                        )
+                        if is_waf:
+                            raise ChallengeRequiredError(
+                                f"waf challenge required (status={status})",
+                                url=url,
+                                final_url=final_url,
+                                status=int(status),
+                                text_head=text[:200],
+                            )
+                        raise BlockedError(
+                            f"blocked or not logged in (status={status})"
+                        )
+
+                    try:
+                        obj = json.loads(text)
+                    except Exception as e:
+                        preview, truncated, total_len = text_preview(text)
+                        self._http_debug_log(
+                            f"{label} attempt={attempt_no}/{total_attempts} json_parse_failed "
+                            f"status={int(status)} text_len={total_len} "
+                            f"text_head={single_line_text(preview)} truncated={int(truncated)} "
+                            f"error={single_line_text(str(e))}"
+                        )
+                        if (
+                            ("alichlgref=" in final_url.lower())
+                            or ("md5__1038=" in final_url.lower())
+                            or ("_waf_" in final_url.lower())
+                            or _looks_like_waf_challenge(text)
+                        ):
+                            raise ChallengeRequiredError(
+                                f"waf challenge required (status={status})",
+                                url=url,
+                                final_url=final_url,
+                                status=int(status),
+                                text_head=text[:200],
+                            ) from e
+                        if _looks_like_html(text):
+                            raise BlockedError(
+                                f"blocked or not logged in (status={status})"
+                            ) from e
+                        raise
+
+                    issue = retry_reason(obj) if retry_reason is not None else None
+                    if issue is not None:
+                        payload_summary = summarize_payload(obj)
+                        preview, truncated, total_len = text_preview(text)
+                        self._http_debug_log(
+                            f"{label} attempt={attempt_no}/{total_attempts} bad_payload "
+                            f"status={int(status)} issue={single_line_text(str(issue))} "
+                            f"{payload_summary} "
+                            f"url={sanitize_url_for_debug(url)} "
+                            f"final_url={sanitize_url_for_debug(final_url)}"
+                        )
+                        self._http_debug_log(
+                            f"{label} attempt={attempt_no}/{total_attempts} bad_payload "
+                            f"text_len={total_len} text_head={single_line_text(preview)} "
+                            f"truncated={int(truncated)}"
+                        )
+                        if attempt < int(self._cfg.max_retries):
+                            print(
+                                f"[api-retry] trace_id={trace_id} {label} bad payload, "
+                                f"attempt {attempt + 1}/{int(self._cfg.max_retries) + 1}: {issue}",
+                                file=sys.stderr,
+                            )
+                            time.sleep(min(backoff, 60.0))
+                            backoff *= 2
+                            continue
+                        raise RuntimeError(f"{label} still bad after retries: {issue}")
+
+                    self._consecutive_blocks = 0
+                    return obj
+                except ChallengeRequiredError:
                     self._http_debug_log(
-                        f"{label} attempt={attempt_no}/{total_attempts} bad_payload "
-                        f"text_len={total_len} text_head={single_line_text(preview)} "
-                        f"truncated={int(truncated)}"
+                        f"{label} attempt={attempt_no}/{total_attempts} challenge_required"
                     )
-                    if attempt < int(self._cfg.max_retries):
+                    raise
+                except BlockedError as e:
+                    self._consecutive_blocks += 1
+                    last_exc = e
+                    self._http_debug_log(
+                        f"{label} attempt={attempt_no}/{total_attempts} blocked "
+                        f"error={single_line_text(str(e))}"
+                    )
+                except Exception as e:
+                    last_exc = e
+                    self._http_debug_log(
+                        f"{label} attempt={attempt_no}/{total_attempts} failed "
+                        f"error={single_line_text(str(e))}"
+                    )
+
+                if attempt < int(self._cfg.max_retries):
+                    if last_exc is not None:
                         print(
-                            f"[api-retry] {label} bad payload, attempt {attempt + 1}/{int(self._cfg.max_retries) + 1}: {issue}",
+                            f"[api-retry] trace_id={trace_id} {label} request failed, "
+                            f"attempt {attempt + 1}/{int(self._cfg.max_retries) + 1}: {last_exc}",
                             file=sys.stderr,
                         )
-                        time.sleep(min(backoff, 60.0))
-                        backoff *= 2
-                        continue
-                    raise RuntimeError(f"{label} still bad after retries: {issue}")
+                    time.sleep(min(backoff, 60.0))
+                    backoff *= 2
 
-                self._consecutive_blocks = 0
-                return obj
-            except ChallengeRequiredError:
-                self._http_debug_log(
-                    f"{label} attempt={attempt_no}/{total_attempts} challenge_required"
-                )
-                raise
-            except BlockedError as e:
-                self._consecutive_blocks += 1
-                last_exc = e
-                self._http_debug_log(
-                    f"{label} attempt={attempt_no}/{total_attempts} blocked "
-                    f"error={single_line_text(str(e))}"
-                )
-            except Exception as e:
-                last_exc = e
-                self._http_debug_log(
-                    f"{label} attempt={attempt_no}/{total_attempts} failed "
-                    f"error={single_line_text(str(e))}"
-                )
+                if self._consecutive_blocks >= int(self._cfg.max_consecutive_blocks):
+                    raise BlockedError(
+                        f"too many blocked responses ({self._consecutive_blocks}), stop to protect account"
+                    ) from last_exc
 
-            if attempt < int(self._cfg.max_retries):
-                if last_exc is not None:
-                    print(
-                        f"[api-retry] {label} request failed, attempt {attempt + 1}/{int(self._cfg.max_retries) + 1}: {last_exc}",
-                        file=sys.stderr,
-                    )
-                time.sleep(min(backoff, 60.0))
-                backoff *= 2
-
-            if self._consecutive_blocks >= int(self._cfg.max_consecutive_blocks):
-                raise BlockedError(
-                    f"too many blocked responses ({self._consecutive_blocks}), stop to protect account"
-                ) from last_exc
-
-        assert last_exc is not None
-        raise last_exc
+            assert last_exc is not None
+            raise last_exc
+        finally:
+            self._pop_trace_id(previous_trace_id)
 
     def fetch_timeline_first_page(self, user_id: str) -> dict[str, Any]:
         uid = str(user_id or "").strip()
