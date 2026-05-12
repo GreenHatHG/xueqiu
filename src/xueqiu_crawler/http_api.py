@@ -15,7 +15,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
-from .constants import BASE_URL, TALKS_PAGE_SIZE, USER_COMMENTS_PAGE_SIZE
+from .constants import (
+    BASE_URL,
+    STOCK_BASE_URL,
+    TALKS_PAGE_SIZE,
+    USER_COMMENTS_PAGE_SIZE,
+)
 from .http_debug import (
     sanitize_url_for_debug,
     single_line_text,
@@ -329,6 +334,10 @@ class XueqiuHttpApi:
 
     def build_url(self, path: str, params: Optional[dict[str, Any]] = None) -> str:
         p = str(path or "").strip()
+        if p.startswith("http://") or p.startswith("https://"):
+            query = urlencode(params or {})
+            separator = "&" if "?" in p else "?"
+            return f"{p}{separator}{query}" if query else p
         if not p.startswith("/"):
             p = f"/{p}" if p else ""
         query = urlencode(params or {})
@@ -753,11 +762,19 @@ class XueqiuHttpApi:
                     f"referrer={sanitize_url_for_debug(str(referrer or ''))}"
                 )
                 try:
-                    status, text, final_url = self._fetch_text_once(
-                        url,
-                        referrer=referrer,
-                        trace_id=trace_id,
-                    )
+                    try:
+                        status, text, final_url = self._fetch_text_once(
+                            url,
+                            referrer=referrer,
+                            trace_id=trace_id,
+                        )
+                    except TypeError as e:
+                        if "trace_id" not in str(e) or "unexpected keyword" not in str(e):
+                            raise
+                        status, text, final_url = self._fetch_text_once(
+                            url,
+                            referrer=referrer,
+                        )
 
                     looks_html = _looks_like_html(text)
                     elapsed_ms = int((time.monotonic() - attempt_started) * 1000)
@@ -886,6 +903,98 @@ class XueqiuHttpApi:
             raise last_exc
         finally:
             self._pop_trace_id(previous_trace_id)
+
+    def fetch_json(
+        self,
+        path: str,
+        params: Optional[dict[str, Any]] = None,
+        *,
+        referrer: Optional[str] = None,
+        retry_reason: Optional[Callable[[Any], Optional[str]]] = None,
+        request_label: Optional[str] = None,
+    ) -> Any:
+        url = self.build_url(path, params or {})
+        return self._fetch_json_with_retry(
+            url,
+            referrer=referrer,
+            retry_reason=retry_reason,
+            request_label=request_label or path,
+        )
+
+    def fetch_user_followed_portfolios(
+        self,
+        user_id: str,
+        *,
+        size: int = 1000,
+        category: int = 3,
+        pid: int = -120,
+    ) -> dict[str, Any]:
+        uid = str(user_id or "").strip()
+        if not uid:
+            raise ValueError("user_id is empty")
+        size_i = max(1, int(size))
+
+        obj = self.fetch_json(
+            f"{STOCK_BASE_URL}/v5/stock/portfolio/stock/list.json",
+            {
+                "size": size_i,
+                "category": int(category),
+                "uid": uid,
+                "pid": int(pid),
+            },
+            referrer=f"{BASE_URL}/u/{uid}",
+            request_label=f"followed-portfolios user={uid} size={size_i}",
+        )
+        return obj if isinstance(obj, dict) else {"data": obj}
+
+    def fetch_portfolio_quote(self, portfolio_symbol: str) -> dict[str, Any]:
+        symbol = str(portfolio_symbol or "").strip().upper()
+        if not symbol:
+            raise ValueError("portfolio_symbol is empty")
+
+        obj = self.fetch_json(
+            "/cubes/quote.json",
+            {"code": symbol},
+            referrer=f"{BASE_URL}/P/{symbol}",
+            request_label=f"portfolio-quote symbol={symbol}",
+        )
+        return obj if isinstance(obj, dict) else {"data": obj}
+
+    def fetch_portfolio_current(self, portfolio_symbol: str) -> dict[str, Any]:
+        symbol = str(portfolio_symbol or "").strip().upper()
+        if not symbol:
+            raise ValueError("portfolio_symbol is empty")
+
+        obj = self.fetch_json(
+            "/cubes/rebalancing/current.json",
+            {"cube_symbol": symbol},
+            referrer=f"{BASE_URL}/P/{symbol}",
+            request_label=f"portfolio-current symbol={symbol}",
+        )
+        return obj if isinstance(obj, dict) else {"data": obj}
+
+    def fetch_portfolio_rebalancing_history(
+        self,
+        portfolio_symbol: str,
+        *,
+        count: int,
+        page: int,
+    ) -> dict[str, Any]:
+        symbol = str(portfolio_symbol or "").strip().upper()
+        if not symbol:
+            raise ValueError("portfolio_symbol is empty")
+
+        obj = self.fetch_json(
+            "/cubes/rebalancing/history.json",
+            {
+                "cube_symbol": symbol,
+                "count": int(count),
+                "page": int(page),
+            },
+            referrer=f"{BASE_URL}/P/{symbol}",
+            request_label=f"portfolio-rebalancing-history symbol={symbol} page={page}",
+        )
+        return obj if isinstance(obj, dict) else {"data": obj}
 
     def fetch_timeline_first_page(self, user_id: str) -> dict[str, Any]:
         uid = str(user_id or "").strip()

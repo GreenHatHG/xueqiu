@@ -25,6 +25,7 @@ dev = [
 [project.scripts]
 xq-crawl = "xueqiu_crawler.cli:main"
 xq-rss = "xueqiu_crawler.rss_server:main"
+xq-portfolio-api = "xueqiu_crawler.portfolio_server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -49,4 +50,6 @@ ignore_names = [
   "root",
   "healthz",
   "user_rss",
+  "user_followed_portfolios",
+  "user_followed_portfolio_snapshots",
 ]

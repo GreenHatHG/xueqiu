@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 BASE_URL = "https://xueqiu.com"
+STOCK_BASE_URL = "https://stock.xueqiu.com"
 BEIJING_TIMEZONE_NAME = "Asia/Shanghai"
 
 DEFAULT_USER_DATA_DIR = Path(".playwright") / "user-data"
