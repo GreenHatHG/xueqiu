@@ -8,12 +8,12 @@ from unittest.mock import patch
 
 from xueqiu_crawler.constants import STOCK_BASE_URL
 from xueqiu_crawler.http_api import HttpClientConfig, XueqiuHttpApi
-from xueqiu_crawler.portfolio_server import (
+from xueqiu_crawler.portfolio_routes import (
     _extract_portfolio_rows,
-    app,
     user_followed_portfolio_snapshots,
     user_followed_portfolios,
 )
+from xueqiu_crawler.rss_server import app
 from xueqiu_crawler.xq_api import ApiConfig
 
 
@@ -138,6 +138,12 @@ class PortfolioRouteTests(unittest.TestCase):
         else:
             os.environ["XQ_PORTFOLIO_KEY"] = self.old_key
 
+    def test_portfolio_routes_are_mounted_on_rss_app(self) -> None:
+        paths = {str(route.path) for route in app.routes if hasattr(route, "path")}
+        self.assertIn("/users/{user_id}/followed-portfolios", paths)
+        self.assertIn("/users/{user_id}/followed-portfolios/snapshots", paths)
+        self.assertIn("/u/{user_id}", paths)
+
     def test_user_followed_portfolios_returns_upstream_payload(self) -> None:
         calls: dict[str, Any] = {}
 
@@ -159,7 +165,7 @@ class PortfolioRouteTests(unittest.TestCase):
             url=SimpleNamespace(query="key=k&size=50"),
             app=app,
         )
-        with patch("xueqiu_crawler.portfolio_server._build_api", return_value=fake_api):
+        with patch("xueqiu_crawler.portfolio_routes._build_api", return_value=fake_api):
             resp = user_followed_portfolios("4776750571", cast(Any, request))
 
         self.assertEqual(resp.status_code, 200)
@@ -227,7 +233,7 @@ class PortfolioRouteTests(unittest.TestCase):
             ),
             app=app,
         )
-        with patch("xueqiu_crawler.portfolio_server._build_api", return_value=fake_api):
+        with patch("xueqiu_crawler.portfolio_routes._build_api", return_value=fake_api):
             resp = user_followed_portfolio_snapshots("4776750571", cast(Any, request))
 
         self.assertEqual(resp.status_code, 200)
@@ -283,7 +289,7 @@ class PortfolioRouteTests(unittest.TestCase):
             fetch_portfolio_rebalancing_history=_fake_history,
         )
         request = SimpleNamespace(url=SimpleNamespace(query="key=k"), app=app)
-        with patch("xueqiu_crawler.portfolio_server._build_api", return_value=fake_api):
+        with patch("xueqiu_crawler.portfolio_routes._build_api", return_value=fake_api):
             resp = user_followed_portfolio_snapshots("4776750571", cast(Any, request))
 
         self.assertEqual(resp.status_code, 200)
@@ -318,7 +324,7 @@ class PortfolioRouteTests(unittest.TestCase):
             url=SimpleNamespace(query="key=k&include_current=0&include_history=0"),
             app=app,
         )
-        with patch("xueqiu_crawler.portfolio_server._build_api", return_value=fake_api):
+        with patch("xueqiu_crawler.portfolio_routes._build_api", return_value=fake_api):
             resp = user_followed_portfolio_snapshots("4776750571", cast(Any, request))
 
         self.assertEqual(resp.status_code, 200)

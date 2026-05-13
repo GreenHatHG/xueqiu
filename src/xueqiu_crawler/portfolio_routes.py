@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import argparse
 import os
 import re
-import sys
 import threading
 from typing import Any, Optional
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs
 
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from .constants import (
@@ -17,20 +15,15 @@ from .constants import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_MIN_DELAY_SEC,
 )
-from .env_file import load_dotenv
 from .http_api import XueqiuHttpApi
 from .http_debug import env_flag_enabled
 from .xq_api import ApiConfig
-
-
-load_dotenv()
 
 
 XQ_PORTFOLIO_KEY_ENV = "XQ_PORTFOLIO_KEY"
 XQ_HTTP_DEBUG_ENV = "XQ_HTTP_DEBUG"
 
 API_KEY_QUERY_PARAM = "key"
-API_KEY_MASKED_VALUE = "***"
 
 DEFAULT_FOLLOWED_PORTFOLIO_SIZE = 1000
 MAX_FOLLOWED_PORTFOLIO_SIZE = 1000
@@ -46,7 +39,7 @@ PORTFOLIO_SYMBOL_PATTERN = re.compile(r"\bZH[0-9A-Z]+\b", re.IGNORECASE)
 
 _UPSTREAM_LOCK = threading.Lock()
 
-app = FastAPI()
+router = APIRouter()
 
 
 def _env_str(name: str) -> str:
@@ -58,20 +51,6 @@ def _query_first(query: dict[str, list[str]], name: str) -> str:
     if not isinstance(values, list) or not values:
         return ""
     return str(values[0] or "").strip()
-
-
-def _mask_key_in_path(raw_path: str) -> str:
-    try:
-        parsed = urlparse(str(raw_path or ""))
-        query = parse_qs(str(parsed.query or ""))
-        if API_KEY_QUERY_PARAM not in query:
-            return str(raw_path or "")
-        query[API_KEY_QUERY_PARAM] = [API_KEY_MASKED_VALUE]
-        masked_query = urlencode(query, doseq=True)
-        path = str(parsed.path or "")
-        return f"{path}?{masked_query}" if masked_query else path
-    except Exception:
-        return str(raw_path or "")
 
 
 def _parse_int(
@@ -182,7 +161,14 @@ def _extract_symbol_from_text(value: Any) -> str:
 
 
 def _portfolio_symbol(item: dict[str, Any]) -> str:
-    for key in ("symbol", "stock_symbol", "stockSymbol", "cube_symbol", "cubeSymbol", "code"):
+    for key in (
+        "symbol",
+        "stock_symbol",
+        "stockSymbol",
+        "cube_symbol",
+        "cubeSymbol",
+        "code",
+    ):
         symbol = _extract_symbol_from_text(item.get(key))
         if symbol:
             return symbol
@@ -234,54 +220,7 @@ def _extract_portfolio_rows(
     return rows
 
 
-@app.middleware("http")
-async def _access_log(request: Request, call_next):  # type: ignore[no-untyped-def]
-    try:
-        response = await call_next(request)
-    except Exception:
-        client_host = "-"
-        try:
-            client_host = str(request.client.host) if request.client else "-"
-        except Exception:
-            client_host = "-"
-        raw_path = str(request.url.path or "")
-        if request.url.query:
-            raw_path = f"{raw_path}?{request.url.query}"
-        print(
-            f"[portfolio-api] {client_host} {request.method} {_mask_key_in_path(raw_path)} - 500",
-            flush=True,
-        )
-        raise
-
-    client_host = "-"
-    try:
-        client_host = str(request.client.host) if request.client else "-"
-    except Exception:
-        client_host = "-"
-    raw_path = str(request.url.path or "")
-    if request.url.query:
-        raw_path = f"{raw_path}?{request.url.query}"
-    print(
-        f"[portfolio-api] {client_host} {request.method} {_mask_key_in_path(raw_path)} - {response.status_code}",
-        flush=True,
-    )
-    return response
-
-
-@app.get("/")
-def root() -> PlainTextResponse:
-    return PlainTextResponse(
-        "ok\nTry: /users/{user_id}/followed-portfolios?key=YOUR_KEY\n",
-        status_code=200,
-    )
-
-
-@app.get("/healthz")
-def healthz() -> PlainTextResponse:
-    return PlainTextResponse("ok\n", status_code=200)
-
-
-@app.get("/users/{user_id}/followed-portfolios")
+@router.get("/users/{user_id}/followed-portfolios")
 def user_followed_portfolios(user_id: str, request: Request) -> Response:
     uid = str(user_id or "").strip()
     if not uid:
@@ -331,7 +270,7 @@ def user_followed_portfolios(user_id: str, request: Request) -> Response:
         return _json_upstream_error(e)
 
 
-@app.get("/users/{user_id}/followed-portfolios/snapshots")
+@router.get("/users/{user_id}/followed-portfolios/snapshots")
 def user_followed_portfolio_snapshots(user_id: str, request: Request) -> Response:
     uid = str(user_id or "").strip()
     if not uid:
@@ -472,41 +411,3 @@ def user_followed_portfolio_snapshots(user_id: str, request: Request) -> Respons
         )
     except Exception as e:
         return _json_upstream_error(e)
-
-
-def main(argv: Optional[list[str]] = None) -> int:
-    import uvicorn
-
-    def _argv_has(raw: list[str], flag: str) -> bool:
-        f = str(flag or "").strip()
-        if not f:
-            return False
-        for item in raw:
-            s = str(item or "").strip()
-            if s == f or s.startswith(f"{f}="):
-                return True
-        return False
-
-    p = argparse.ArgumentParser(prog="xq-portfolio-api")
-    p.add_argument("--host", default="0.0.0.0", help="listen host (default 0.0.0.0)")
-    p.add_argument("--port", type=int, default=8001, help="listen port (default 8001)")
-    args = p.parse_args(argv)
-
-    host = str(args.host or "0.0.0.0").strip() or "0.0.0.0"
-    port = int(args.port or 8001)
-    raw_argv = sys.argv[1:] if argv is None else list(argv)
-    if not _argv_has(raw_argv, "--port"):
-        env_port = str(os.environ.get("PORT", "") or "").strip()
-        if env_port:
-            try:
-                port = int(env_port)
-            except Exception:
-                pass
-
-    print(f"[portfolio-api] listen http://{host}:{port}", flush=True)
-    uvicorn.run(app, host=host, port=int(port), workers=1, access_log=False)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
