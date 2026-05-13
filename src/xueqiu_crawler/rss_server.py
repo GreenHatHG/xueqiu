@@ -30,6 +30,8 @@ from .constants import (
     DEFAULT_OUTPUT_DIR,
 )
 from .http_debug import env_flag_enabled
+from .env_file import load_dotenv
+from .portfolio_routes import router as portfolio_router
 from .sqlite_maintenance import maybe_cleanup_old_data
 from .storage import (
     MERGED_TABLE_NAME,
@@ -45,6 +47,9 @@ from .text_sanitize import (
     strip_reply_wrappers,
     split_reply_chain_for_rss,
 )
+
+
+load_dotenv()
 
 
 # Env vars for this service.
@@ -563,6 +568,7 @@ def _refresh_user_incremental_http(
 app = FastAPI()
 # Keep CLI args in app state so both `python -m ...` and `uvicorn module:app` work.
 app.state.cli_db_path = ""
+app.include_router(portfolio_router)
 
 
 @app.middleware("http")

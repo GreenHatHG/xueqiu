@@ -49,4 +49,6 @@ ignore_names = [
   "root",
   "healthz",
   "user_rss",
+  "user_followed_portfolios",
+  "user_followed_portfolio_snapshots",
 ]
