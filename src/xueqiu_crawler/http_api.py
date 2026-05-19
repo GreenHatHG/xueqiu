@@ -702,7 +702,7 @@ class XueqiuHttpApi:
         return None
 
     @staticmethod
-    def _is_terminal_empty_user_comments_page(obj: Any) -> bool:
+    def _is_no_visible_user_comments_page(obj: Any) -> bool:
         if not isinstance(obj, dict):
             return False
         items = obj.get("items")
@@ -710,7 +710,9 @@ class XueqiuHttpApi:
             return False
         next_max_id = str(obj.get("next_max_id") or "").strip()
         next_id = str(obj.get("next_id") or "").strip()
-        return next_max_id == "-1" and next_id == "-1"
+        if next_max_id == "-1" and next_id == "-1":
+            return True
+        return not next_max_id and not next_id
 
     @staticmethod
     def _extract_timeline_rows(obj: Any) -> Optional[list[Any]]:
@@ -769,7 +771,9 @@ class XueqiuHttpApi:
                             trace_id=trace_id,
                         )
                     except TypeError as e:
-                        if "trace_id" not in str(e) or "unexpected keyword" not in str(e):
+                        if "trace_id" not in str(e) or "unexpected keyword" not in str(
+                            e
+                        ):
                             raise
                         status, text, final_url = self._fetch_text_once(
                             url,
@@ -1025,12 +1029,10 @@ class XueqiuHttpApi:
         )
 
         def _retry_reason(payload: Any) -> Optional[str]:
-            allow_terminal_empty = True
             return self._describe_collection_payload_issue(
                 payload,
                 list_key="items",
-                allow_empty=allow_terminal_empty
-                and self._is_terminal_empty_user_comments_page(payload),
+                allow_empty=self._is_no_visible_user_comments_page(payload),
             )
 
         obj = self._fetch_json_with_retry(

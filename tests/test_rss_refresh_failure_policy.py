@@ -15,11 +15,11 @@ from xueqiu_crawler import cli
 from xueqiu_crawler import rss_server
 from xueqiu_crawler.http_api import HttpClientConfig, XueqiuHttpApi
 from xueqiu_crawler.storage import SqliteDb
-from xueqiu_crawler.xq_api import ApiConfig
+from xueqiu_crawler.xq_api import ApiConfig, XueqiuApi
 
 
 class TimelinePayloadValidationTests(unittest.TestCase):
-    def test_fetch_timeline_first_page_rejects_error_payload(self) -> None:
+    def _build_http_api(self) -> XueqiuHttpApi:
         cfg = ApiConfig(
             min_delay_sec=0.0,
             jitter_sec=0.0,
@@ -27,10 +27,23 @@ class TimelinePayloadValidationTests(unittest.TestCase):
             max_consecutive_blocks=3,
             http_debug=False,
         )
-        api = XueqiuHttpApi(
+        return XueqiuHttpApi(
             cfg,
             HttpClientConfig(cookie="xq_a_token=fake", timeout_sec=1.0),
         )
+
+    def _build_browser_api(self) -> XueqiuApi:
+        cfg = ApiConfig(
+            min_delay_sec=0.0,
+            jitter_sec=0.0,
+            max_retries=0,
+            max_consecutive_blocks=3,
+            http_debug=False,
+        )
+        return XueqiuApi(None, cfg)
+
+    def test_fetch_timeline_first_page_rejects_error_payload(self) -> None:
+        api = self._build_http_api()
         bad_payload = json.dumps(
             {
                 "error_description": "遇到错误，请刷新页面或者重新登录帐号后再试",
@@ -45,6 +58,43 @@ class TimelinePayloadValidationTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             api.fetch_timeline_first_page("8790885129")
+
+    def test_fetch_user_comments_first_page_accepts_empty_payload_without_cursors(
+        self,
+    ) -> None:
+        api = self._build_http_api()
+        empty_payload = json.dumps({"items": []})
+        api._fetch_text_once = lambda url, referrer=None: (  # type: ignore[assignment,misc]
+            200,
+            empty_payload,
+            str(url),
+        )
+
+        next_max_id, items = api.fetch_user_comments_first_page("8790885129")
+
+        self.assertEqual(next_max_id, -1)
+        self.assertEqual(items, [])
+
+    def test_iter_user_comments_pages_accepts_empty_first_page_without_cursors(
+        self,
+    ) -> None:
+        api = self._build_browser_api()
+        empty_payload = json.dumps({"items": []})
+        api._fetch_text_once = lambda url, referrer=None: (  # type: ignore[assignment,misc]
+            200,
+            empty_payload,
+            str(url),
+        )
+
+        pages = list(
+            api.iter_user_comments_pages(
+                "8790885129",
+                start_max_id=-1,
+                max_pages=1,
+            )
+        )
+
+        self.assertEqual(pages, [])
 
 
 class IncrementalHttpFailurePolicyTests(unittest.TestCase):

@@ -694,7 +694,7 @@ class XueqiuApi:
         return None
 
     @staticmethod
-    def _is_terminal_empty_user_comments_page(obj: Any) -> bool:
+    def _is_no_visible_user_comments_page(obj: Any) -> bool:
         if not isinstance(obj, dict):
             return False
         items = obj.get("items")
@@ -702,7 +702,9 @@ class XueqiuApi:
             return False
         next_max_id = str(obj.get("next_max_id") or "").strip()
         next_id = str(obj.get("next_id") or "").strip()
-        return next_max_id == "-1" and next_id == "-1"
+        if next_max_id == "-1" and next_id == "-1":
+            return True
+        return not next_max_id and not next_id
 
     def _fetch_json_with_retry(
         self,
@@ -917,7 +919,7 @@ class XueqiuApi:
                 "/statuses/user/comments.json",
                 {"user_id": user_id, "size": USER_COMMENTS_PAGE_SIZE, "max_id": max_id},
             )
-            allow_terminal_empty = _page_idx == 1
+            allow_initial_empty = _page_idx == 1
 
             def _retry_reason(payload: Any) -> Optional[str]:
                 return self._describe_collection_payload_issue(
@@ -925,8 +927,8 @@ class XueqiuApi:
                     list_key="items",
                     allow_empty=(_page_idx > 1)
                     or (
-                        allow_terminal_empty
-                        and self._is_terminal_empty_user_comments_page(payload)
+                        allow_initial_empty
+                        and self._is_no_visible_user_comments_page(payload)
                     ),
                 )
 
@@ -937,9 +939,9 @@ class XueqiuApi:
             )
             items = obj.get("items") or []
             if not items:
-                if _page_idx == 1 and self._is_terminal_empty_user_comments_page(obj):
+                if _page_idx == 1 and self._is_no_visible_user_comments_page(obj):
                     print(
-                        f"[comments-api] user={user_id} 第一批为空且 next_max_id=-1，按无可见回复处理",
+                        f"[comments-api] user={user_id} 第一批为空，按无可见回复处理",
                         file=sys.stderr,
                     )
                 break
