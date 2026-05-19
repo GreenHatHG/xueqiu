@@ -698,13 +698,7 @@ class XueqiuApi:
         if not isinstance(obj, dict):
             return False
         items = obj.get("items")
-        if not isinstance(items, list) or items:
-            return False
-        next_max_id = str(obj.get("next_max_id") or "").strip()
-        next_id = str(obj.get("next_id") or "").strip()
-        if next_max_id == "-1" and next_id == "-1":
-            return True
-        return not next_max_id and not next_id
+        return isinstance(items, list) and not items
 
     def _fetch_json_with_retry(
         self,

@@ -59,11 +59,13 @@ class TimelinePayloadValidationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             api.fetch_timeline_first_page("8790885129")
 
-    def test_fetch_user_comments_first_page_accepts_empty_payload_without_cursors(
+    def test_fetch_user_comments_first_page_accepts_empty_payload_with_next_cursor(
         self,
     ) -> None:
         api = self._build_http_api()
-        empty_payload = json.dumps({"items": []})
+        empty_payload = json.dumps(
+            {"items": [], "size": 20, "next_max_id": 400598700, "next_id": 400512003}
+        )
         api._fetch_text_once = lambda url, referrer=None: (  # type: ignore[assignment,misc]
             200,
             empty_payload,
@@ -72,14 +74,16 @@ class TimelinePayloadValidationTests(unittest.TestCase):
 
         next_max_id, items = api.fetch_user_comments_first_page("8790885129")
 
-        self.assertEqual(next_max_id, -1)
+        self.assertEqual(next_max_id, 400598700)
         self.assertEqual(items, [])
 
-    def test_iter_user_comments_pages_accepts_empty_first_page_without_cursors(
+    def test_iter_user_comments_pages_accepts_empty_first_page_with_next_cursor(
         self,
     ) -> None:
         api = self._build_browser_api()
-        empty_payload = json.dumps({"items": []})
+        empty_payload = json.dumps(
+            {"items": [], "size": 20, "next_max_id": 400598700, "next_id": 400512003}
+        )
         api._fetch_text_once = lambda url, referrer=None: (  # type: ignore[assignment,misc]
             200,
             empty_payload,
