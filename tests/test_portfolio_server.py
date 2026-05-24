@@ -10,6 +10,7 @@ from xueqiu_crawler.constants import STOCK_BASE_URL
 from xueqiu_crawler.http_api import HttpClientConfig, XueqiuHttpApi
 from xueqiu_crawler.portfolio_routes import (
     _extract_portfolio_rows,
+    portfolio_snapshot,
     user_followed_portfolio_snapshots,
     user_followed_portfolios,
 )
@@ -140,6 +141,8 @@ class PortfolioRouteTests(unittest.TestCase):
 
     def test_portfolio_routes_are_mounted_on_rss_app(self) -> None:
         paths = {str(route.path) for route in app.routes if hasattr(route, "path")}
+        self.assertIn("/portfolios/{portfolio_symbol}/snapshot", paths)
+        self.assertIn("/portfolios/{portfolio_symbol}/rebalancing-history", paths)
         self.assertIn("/users/{user_id}/followed-portfolios", paths)
         self.assertIn("/users/{user_id}/followed-portfolios/snapshots", paths)
         self.assertIn("/u/{user_id}", paths)
@@ -337,6 +340,59 @@ class PortfolioRouteTests(unittest.TestCase):
         self.assertIn('"symbol":"ZH111111"', text)
         self.assertNotIn('"current"', text)
         self.assertNotIn('"rebalancing_history"', text)
+
+    def test_portfolio_snapshot_returns_current_and_history(self) -> None:
+        calls: list[tuple[str, Any]] = []
+
+        def _fake_current(symbol: str) -> dict[str, Any]:
+            calls.append(("current", symbol))
+            return {"symbol": symbol, "holdings": []}
+
+        def _fake_history(symbol: str, *, count: int, page: int) -> dict[str, Any]:
+            calls.append(("history", {"symbol": symbol, "count": count, "page": page}))
+            return {"symbol": symbol, "page": page, "list": [{"id": 1}]}
+
+        fake_api = SimpleNamespace(
+            fetch_portfolio_current=_fake_current,
+            fetch_portfolio_rebalancing_history=_fake_history,
+        )
+        request = SimpleNamespace(
+            url=SimpleNamespace(query="key=k&count=30&page=2"),
+            app=app,
+        )
+        with patch("xueqiu_crawler.portfolio_routes._build_api", return_value=fake_api):
+            resp = portfolio_snapshot("zh838108", cast(Any, request))
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            calls,
+            [
+                ("current", "ZH838108"),
+                ("history", {"symbol": "ZH838108", "count": 30, "page": 2}),
+            ],
+        )
+        body = resp.body
+        if isinstance(body, memoryview):
+            body = body.tobytes()
+        text = body.decode("utf-8", errors="replace")
+        self.assertIn('"symbol":"ZH838108"', text)
+        self.assertIn('"count":30', text)
+        self.assertIn('"page":2', text)
+        self.assertIn('"holdings":[]', text)
+        self.assertIn('"id":1', text)
+
+    def test_portfolio_snapshot_rejects_bad_symbol(self) -> None:
+        request = SimpleNamespace(url=SimpleNamespace(query="key=k"), app=app)
+        resp = portfolio_snapshot("SH600000", cast(Any, request))
+
+        self.assertEqual(resp.status_code, 400)
+        body = resp.body
+        if isinstance(body, memoryview):
+            body = body.tobytes()
+        self.assertIn(
+            "portfolio_symbol is invalid",
+            body.decode("utf-8", errors="replace"),
+        )
 
 
 if __name__ == "__main__":

@@ -33,6 +33,7 @@ DEFAULT_HISTORY_COUNT = 20
 MAX_HISTORY_COUNT = 200
 DEFAULT_HISTORY_PAGES = 1
 MAX_HISTORY_PAGES = 10
+DEFAULT_HISTORY_PAGE = 1
 DEFAULT_MAX_PORTFOLIOS = 10
 MAX_PORTFOLIOS = 200
 PORTFOLIO_SYMBOL_PATTERN = re.compile(r"\bZH[0-9A-Z]+\b", re.IGNORECASE)
@@ -220,6 +221,27 @@ def _extract_portfolio_rows(
     return rows
 
 
+def _simplify_current(raw: dict[str, Any]) -> dict[str, Any]:
+    """从上游 current.json 响应中提取调用方关心的字段。"""
+    last_rb = raw.get("last_success_rb") or raw.get("last_rb") or {}
+    holdings = last_rb.get("holdings")
+    return {
+        "holdings": [
+            {
+                "stock_symbol": h.get("stock_symbol"),
+                "stock_name": h.get("stock_name"),
+                "weight": h.get("weight"),
+                "volume": h.get("volume"),
+            }
+            for h in holdings
+        ]
+        if holdings
+        else [],
+        "cash": last_rb.get("cash"),
+        "updated_at": last_rb.get("updated_at"),
+    }
+
+
 @router.get("/users/{user_id}/followed-portfolios")
 def user_followed_portfolios(user_id: str, request: Request) -> Response:
     uid = str(user_id or "").strip()
@@ -370,7 +392,7 @@ def user_followed_portfolio_snapshots(user_id: str, request: Request) -> Respons
 
                 out = dict(row)
                 if include_current:
-                    out["current"] = current
+                    out["current"] = _simplify_current(current)
                 if include_history:
                     out["rebalancing_history"] = {
                         "count": history_count,
@@ -411,3 +433,58 @@ def user_followed_portfolio_snapshots(user_id: str, request: Request) -> Respons
         )
     except Exception as e:
         return _json_upstream_error(e)
+
+
+@router.get("/portfolios/{portfolio_symbol}/snapshot")
+@router.get("/portfolios/{portfolio_symbol}/rebalancing-history")
+def portfolio_snapshot(portfolio_symbol: str, request: Request) -> Response:
+    symbol = _extract_symbol_from_text(portfolio_symbol)
+    if not symbol:
+        return PlainTextResponse("portfolio_symbol is invalid\n", status_code=400)
+
+    try:
+        query = parse_qs(str(request.url.query or ""))
+        auth_error = _require_api_key(query)
+        if auth_error is not None:
+            return auth_error
+        count = _parse_positive_int(
+            query,
+            "count",
+            default=DEFAULT_HISTORY_COUNT,
+            min_value=1,
+            max_value=MAX_HISTORY_COUNT,
+        )
+        page = _parse_positive_int(
+            query,
+            "page",
+            default=DEFAULT_HISTORY_PAGE,
+            min_value=1,
+        )
+    except Exception as e:
+        return PlainTextResponse(f"bad request: {e}\n", status_code=400)
+
+    try:
+        with _UPSTREAM_LOCK:
+            api = _build_api()
+            current = api.fetch_portfolio_current(symbol)
+            history = api.fetch_portfolio_rebalancing_history(
+                symbol,
+                count=count,
+                page=page,
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "symbol": symbol,
+                "count": count,
+                "page": page,
+                "url": f"https://xueqiu.com/P/{symbol}",
+                "current": _simplify_current(current),
+                "rebalancing_history": history,
+            }
+        )
+    except Exception as e:
+        return _json_upstream_error(e)
+
+
+portfolio_rebalancing_history = portfolio_snapshot
