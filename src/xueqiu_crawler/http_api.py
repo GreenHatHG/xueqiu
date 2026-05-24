@@ -17,7 +17,6 @@ from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from .constants import (
     BASE_URL,
-    STOCK_BASE_URL,
     TALKS_PAGE_SIZE,
     USER_COMMENTS_PAGE_SIZE,
 )
@@ -918,32 +917,6 @@ class XueqiuHttpApi:
             retry_reason=retry_reason,
             request_label=request_label or path,
         )
-
-    def fetch_user_followed_portfolios(
-        self,
-        user_id: str,
-        *,
-        size: int = 1000,
-        category: int = 3,
-        pid: int = -120,
-    ) -> dict[str, Any]:
-        uid = str(user_id or "").strip()
-        if not uid:
-            raise ValueError("user_id is empty")
-        size_i = max(1, int(size))
-
-        obj = self.fetch_json(
-            f"{STOCK_BASE_URL}/v5/stock/portfolio/stock/list.json",
-            {
-                "size": size_i,
-                "category": int(category),
-                "uid": uid,
-                "pid": int(pid),
-            },
-            referrer=f"{BASE_URL}/u/{uid}",
-            request_label=f"followed-portfolios user={uid} size={size_i}",
-        )
-        return obj if isinstance(obj, dict) else {"data": obj}
 
     def fetch_portfolio_quote(self, portfolio_symbol: str) -> dict[str, Any]:
         symbol = str(portfolio_symbol or "").strip().upper()

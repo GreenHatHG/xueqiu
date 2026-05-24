@@ -25,17 +25,9 @@ XQ_HTTP_DEBUG_ENV = "XQ_HTTP_DEBUG"
 
 API_KEY_QUERY_PARAM = "key"
 
-DEFAULT_FOLLOWED_PORTFOLIO_SIZE = 1000
-MAX_FOLLOWED_PORTFOLIO_SIZE = 1000
-DEFAULT_FOLLOWED_PORTFOLIO_CATEGORY = 3
-DEFAULT_FOLLOWED_PORTFOLIO_PID = -120
 DEFAULT_HISTORY_COUNT = 20
 MAX_HISTORY_COUNT = 200
-DEFAULT_HISTORY_PAGES = 1
-MAX_HISTORY_PAGES = 10
 DEFAULT_HISTORY_PAGE = 1
-DEFAULT_MAX_PORTFOLIOS = 10
-MAX_PORTFOLIOS = 200
 PORTFOLIO_SYMBOL_PATTERN = re.compile(r"\bZH[0-9A-Z]+\b", re.IGNORECASE)
 
 _UPSTREAM_LOCK = threading.Lock()
@@ -85,23 +77,6 @@ def _parse_positive_int(
     return int(value)
 
 
-def _parse_bool(
-    query: dict[str, list[str]],
-    name: str,
-    *,
-    default: bool,
-) -> bool:
-    raw = _query_first(query, name)
-    if not raw:
-        return bool(default)
-    value = raw.lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be a boolean")
-
-
 def _require_api_key(query: dict[str, list[str]]) -> Optional[PlainTextResponse]:
     expected_key = _env_str(XQ_PORTFOLIO_KEY_ENV)
     if not expected_key:
@@ -132,93 +107,12 @@ def _json_upstream_error(exc: Exception) -> JSONResponse:
     )
 
 
-def _extract_follow_items(payload: Any) -> list[dict[str, Any]]:
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if not isinstance(payload, dict):
-        return []
-
-    containers: list[dict[str, Any]] = [payload]
-    data = payload.get("data")
-    if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
-    if isinstance(data, dict):
-        containers.append(data)
-
-    for container in containers:
-        for key in ("stocks", "list", "items", "portfolios"):
-            value = container.get(key)
-            if isinstance(value, list):
-                return [item for item in value if isinstance(item, dict)]
-    return []
-
-
 def _extract_symbol_from_text(value: Any) -> str:
     text = str(value or "").strip().upper()
     if not text:
         return ""
     matched = PORTFOLIO_SYMBOL_PATTERN.search(text)
     return str(matched.group(0)).upper() if matched else ""
-
-
-def _portfolio_symbol(item: dict[str, Any]) -> str:
-    for key in (
-        "symbol",
-        "stock_symbol",
-        "stockSymbol",
-        "cube_symbol",
-        "cubeSymbol",
-        "code",
-    ):
-        symbol = _extract_symbol_from_text(item.get(key))
-        if symbol:
-            return symbol
-
-    for key in ("stock", "portfolio", "cube"):
-        nested = item.get(key)
-        if not isinstance(nested, dict):
-            continue
-        for nested_key in (
-            "symbol",
-            "stock_symbol",
-            "stockSymbol",
-            "cube_symbol",
-            "cubeSymbol",
-            "code",
-        ):
-            symbol = _extract_symbol_from_text(nested.get(nested_key))
-            if symbol:
-                return symbol
-
-    for value in item.values():
-        symbol = _extract_symbol_from_text(value)
-        if symbol:
-            return symbol
-    return ""
-
-
-def _extract_portfolio_rows(
-    payload: Any,
-    *,
-    max_portfolios: int,
-) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in _extract_follow_items(payload):
-        symbol = _portfolio_symbol(item)
-        if not symbol or symbol in seen:
-            continue
-        seen.add(symbol)
-        rows.append(
-            {
-                "symbol": symbol,
-                "url": f"https://xueqiu.com/P/{symbol}",
-                "follow_item": item,
-            }
-        )
-        if len(rows) >= int(max_portfolios):
-            break
-    return rows
 
 
 def _simplify_current(raw: dict[str, Any]) -> dict[str, Any]:
@@ -242,201 +136,7 @@ def _simplify_current(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-@router.get("/users/{user_id}/followed-portfolios")
-def user_followed_portfolios(user_id: str, request: Request) -> Response:
-    uid = str(user_id or "").strip()
-    if not uid:
-        return PlainTextResponse("user_id is empty\n", status_code=400)
-
-    try:
-        query = parse_qs(str(request.url.query or ""))
-        auth_error = _require_api_key(query)
-        if auth_error is not None:
-            return auth_error
-        size = _parse_positive_int(
-            query,
-            "size",
-            default=DEFAULT_FOLLOWED_PORTFOLIO_SIZE,
-            min_value=1,
-            max_value=MAX_FOLLOWED_PORTFOLIO_SIZE,
-        )
-        category = _parse_int(
-            query,
-            "category",
-            default=DEFAULT_FOLLOWED_PORTFOLIO_CATEGORY,
-        )
-        pid = _parse_int(query, "pid", default=DEFAULT_FOLLOWED_PORTFOLIO_PID)
-    except Exception as e:
-        return PlainTextResponse(f"bad request: {e}\n", status_code=400)
-
-    try:
-        with _UPSTREAM_LOCK:
-            api = _build_api()
-            result = api.fetch_user_followed_portfolios(
-                uid,
-                size=size,
-                category=category,
-                pid=pid,
-            )
-        return JSONResponse(
-            {
-                "ok": True,
-                "user_id": uid,
-                "size": size,
-                "category": category,
-                "pid": pid,
-                "result": result,
-            }
-        )
-    except Exception as e:
-        return _json_upstream_error(e)
-
-
-@router.get("/users/{user_id}/followed-portfolios/snapshots")
-def user_followed_portfolio_snapshots(user_id: str, request: Request) -> Response:
-    uid = str(user_id or "").strip()
-    if not uid:
-        return PlainTextResponse("user_id is empty\n", status_code=400)
-
-    try:
-        query = parse_qs(str(request.url.query or ""))
-        auth_error = _require_api_key(query)
-        if auth_error is not None:
-            return auth_error
-        size = _parse_positive_int(
-            query,
-            "size",
-            default=DEFAULT_FOLLOWED_PORTFOLIO_SIZE,
-            min_value=1,
-            max_value=MAX_FOLLOWED_PORTFOLIO_SIZE,
-        )
-        category = _parse_int(
-            query,
-            "category",
-            default=DEFAULT_FOLLOWED_PORTFOLIO_CATEGORY,
-        )
-        pid = _parse_int(query, "pid", default=DEFAULT_FOLLOWED_PORTFOLIO_PID)
-        history_count = _parse_positive_int(
-            query,
-            "history_count",
-            default=DEFAULT_HISTORY_COUNT,
-            min_value=1,
-            max_value=MAX_HISTORY_COUNT,
-        )
-        history_pages = _parse_positive_int(
-            query,
-            "history_pages",
-            default=DEFAULT_HISTORY_PAGES,
-            min_value=1,
-            max_value=MAX_HISTORY_PAGES,
-        )
-        max_portfolios = _parse_positive_int(
-            query,
-            "max_portfolios",
-            default=DEFAULT_MAX_PORTFOLIOS,
-            min_value=1,
-            max_value=MAX_PORTFOLIOS,
-        )
-        include_quote = _parse_bool(query, "include_quote", default=False)
-        include_current = _parse_bool(query, "include_current", default=True)
-        include_history = _parse_bool(query, "include_history", default=True)
-    except Exception as e:
-        return PlainTextResponse(f"bad request: {e}\n", status_code=400)
-
-    try:
-        portfolios: list[dict[str, Any]] = []
-        errors: list[dict[str, Any]] = []
-        with _UPSTREAM_LOCK:
-            api = _build_api()
-            followed_payload = api.fetch_user_followed_portfolios(
-                uid,
-                size=size,
-                category=category,
-                pid=pid,
-            )
-            followed_rows = _extract_portfolio_rows(
-                followed_payload,
-                max_portfolios=max_portfolios,
-            )
-
-            for row in followed_rows:
-                symbol = str(row.get("symbol") or "").strip().upper()
-                if not symbol:
-                    continue
-                try:
-                    current = (
-                        api.fetch_portfolio_current(symbol) if include_current else None
-                    )
-                    history_pages_payload = (
-                        [
-                            api.fetch_portfolio_rebalancing_history(
-                                symbol,
-                                count=history_count,
-                                page=page,
-                            )
-                            for page in range(1, history_pages + 1)
-                        ]
-                        if include_history
-                        else []
-                    )
-                except Exception as e:
-                    errors.append(
-                        {
-                            "symbol": symbol,
-                            "url": row.get("url") or f"https://xueqiu.com/P/{symbol}",
-                            "stage": "snapshot",
-                            "error": str(e),
-                        }
-                    )
-                    continue
-
-                out = dict(row)
-                if include_current:
-                    out["current"] = _simplify_current(current)
-                if include_history:
-                    out["rebalancing_history"] = {
-                        "count": history_count,
-                        "pages": history_pages_payload,
-                    }
-                if include_quote:
-                    try:
-                        out["quote"] = api.fetch_portfolio_quote(symbol)
-                    except Exception as e:
-                        errors.append(
-                            {
-                                "symbol": symbol,
-                                "url": row.get("url") or f"https://xueqiu.com/P/{symbol}",
-                                "stage": "quote",
-                                "error": str(e),
-                            }
-                        )
-                        out["quote"] = None
-                portfolios.append(out)
-
-        return JSONResponse(
-            {
-                "ok": True,
-                "user_id": uid,
-                "size": size,
-                "category": category,
-                "pid": pid,
-                "history_count": history_count,
-                "history_pages": history_pages,
-                "max_portfolios": max_portfolios,
-                "include_quote": include_quote,
-                "include_current": include_current,
-                "include_history": include_history,
-                "count": len(portfolios),
-                "portfolios": portfolios,
-                "errors": errors,
-            }
-        )
-    except Exception as e:
-        return _json_upstream_error(e)
-
-
 @router.get("/portfolios/{portfolio_symbol}/snapshot")
-@router.get("/portfolios/{portfolio_symbol}/rebalancing-history")
 def portfolio_snapshot(portfolio_symbol: str, request: Request) -> Response:
     symbol = _extract_symbol_from_text(portfolio_symbol)
     if not symbol:
@@ -487,4 +187,4 @@ def portfolio_snapshot(portfolio_symbol: str, request: Request) -> Response:
         return _json_upstream_error(e)
 
 
-portfolio_rebalancing_history = portfolio_snapshot
+
